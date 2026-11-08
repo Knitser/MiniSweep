@@ -34,6 +34,11 @@ enum Palette {
         return values.map { Color(nsColor: ns($0)) }
     }
     static func tile(_ path: String) -> Color {
+        if let accent = AppIdentity.color(for: path), let sampled = NSColor(accent).usingColorSpace(.sRGB) {
+            var hue: CGFloat = 0, saturation: CGFloat = 0, brightness: CGFloat = 0, alpha: CGFloat = 0
+            sampled.getHue(&hue, saturation: &saturation, brightness: &brightness, alpha: &alpha)
+            return Color(nsColor: NSColor(calibratedHue: hue, saturation: max(0.5, saturation), brightness: 0.46, alpha: 1))
+        }
         let hash = path.utf8.reduce(UInt64(1469598103934665603)) { ($0 ^ UInt64($1)) &* 1099511628211 }
         return tiles[Int(hash % UInt64(tiles.count))]
     }
@@ -118,7 +123,7 @@ struct MainView: View {
         .alert("MiniSweep", isPresented: Binding(get: { model.alert != nil }, set: { if !$0 { model.alert = nil } })) {
             Button("OK", role: .cancel) { model.alert = nil }
         } message: { Text(model.alert ?? "") }
-        .onAppear { if model.nodes.isEmpty && !model.isScanning { model.scan() }; memory.start() }
+        .onAppear { if model.nodes.isEmpty && !model.isScanning { model.startStorage() }; memory.start() }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
             model.stopScan(); model.cleanupHandle?.cancel()
         }
@@ -179,12 +184,14 @@ struct SectionTitle: View {
 struct StorageView: View {
     @ObservedObject var model: SweepModel
     var body: some View {
+        let children = model.childNodes
         SectionTitle(eyebrow: "File system", title: "Storage Explorer", subtitle: "Allocated disk blocks · click a folder block to inspect its contents")
         HStack(spacing: 12) {
             Metric(icon: "internaldrive", title: "Disk space free", value: byteText(model.disk.free), note: "Across the internal APFS container", accent: .orange)
-            Metric(icon: "folder", title: model.isScanning ? "Scanned so far" : "Folder on disk", value: byteText(model.folderBytes), note: shortPath(model.root))
-            Metric(icon: "doc.on.doc", title: "Files counted", value: (model.nodes.first(where: { $0.path == model.root })?.files ?? model.scannedFiles).formatted(), note: model.isScanning ? "Live scan · cancel at any time" : model.scanComplete ? "Finished in \(Int(model.elapsed)) seconds" : "Partial scan or ready to scan")
+            Metric(icon: "folder", title: model.isSavedOverview ? "Saved folder size" : model.overviewDate != nil ? "Indexed folder size" : model.isScanning ? "Scanned so far" : "Folder on disk", value: byteText(model.folderBytes), note: shortPath(model.root))
+            Metric(icon: "doc.on.doc", title: model.isSavedOverview ? "Saved file count" : "Files counted", value: (model.nodes.first(where: { $0.path == model.root })?.files ?? model.scannedFiles).formatted(), note: model.overviewDate != nil ? "\(model.overviewSource) · Refresh to update" : model.isScanning ? "\(Int(model.elapsed))s elapsed · live scan" : model.scanComplete ? "Finished in \(String(format: "%.1f", model.elapsed))s" : "Partial scan or ready to scan")
         }
+        SpaceGuide(model: model)
         Panel(padding: 16) {
             HStack(spacing: 9) {
                 Button { model.navigate(-1) } label: { Image(systemName: "chevron.left") }.buttonStyle(QuietButton()).disabled(model.navigationIndex <= 0).help("Back")
@@ -204,6 +211,15 @@ struct StorageView: View {
                 Spacer()
                 if model.root != "/" { Button { model.scan(URL(fileURLWithPath: model.root).deletingLastPathComponent().path) } label: { Label("Up", systemImage: "arrow.up") }.buttonStyle(.plain).font(.system(size: 11)).foregroundStyle(Palette.secondary) }
             }.padding(.top, 7)
+            if let date = model.overviewDate {
+                HStack(spacing: 8) {
+                    Image(systemName: "clock.arrow.circlepath").foregroundStyle(Palette.green)
+                    Text("\(model.overviewSource) · \(date.formatted(date: .abbreviated, time: .shortened))" + (model.isScanning ? " · checking disk in background" : " · sizes may have changed")).font(.system(size: 10)).foregroundStyle(Palette.secondary)
+                    Spacer()
+                    if model.isSavedOverview { Button("Forget saved overviews") { model.forgetOverviews() }.buttonStyle(.plain).font(.system(size: 10)) }
+                }.padding(.top, 6)
+            }
+            if !model.indexNotice.isEmpty { Text(model.indexNotice).font(.system(size: 10)).foregroundStyle(Palette.secondary) }
             if model.isScanning {
                 ProgressView().progressViewStyle(.linear).tint(Palette.green).padding(.top, 7)
                 Text(shortPath(model.scanPath)).font(.system(size: 10, design: .monospaced)).foregroundStyle(Palette.secondary).lineLimit(1).truncationMode(.middle)
@@ -213,17 +229,17 @@ struct StorageView: View {
             Panel(padding: 18) {
                 VStack(alignment: .leading, spacing: 16) {
                     HStack { Text("The big picture").font(.system(size: 15, weight: .semibold)); Spacer(); Button("All items") { model.showContents = true }.buttonStyle(QuietButton()); Text("ALLOCATED SIZE").font(.system(size: 8, weight: .semibold)).tracking(1).foregroundStyle(Palette.secondary) }
-                    if model.childNodes.isEmpty {
-                        VStack(spacing: 13) { Image(systemName: model.isScanning ? "magnifyingglass" : "folder").font(.system(size: 32)).foregroundStyle(Palette.green); Text(model.isScanning ? "Building your storage map…" : "Choose a folder to explore").font(.system(size: 13)); Text("Folder totals appear as each branch finishes.").font(.system(size: 11)).foregroundStyle(Palette.secondary) }.frame(maxWidth: .infinity).frame(height: 310)
+                    if children.isEmpty {
+                        VStack(spacing: 13) { Image(systemName: model.isScanning ? "magnifyingglass" : "folder").font(.system(size: 32)).foregroundStyle(Palette.green); Text(model.isScanning ? "Building your storage map…" : "Choose a folder to explore").font(.system(size: 13)); Text("Live branch totals appear while the scan runs. The first full scan still needs to read folder metadata.").font(.system(size: 11)).foregroundStyle(Palette.secondary) }.frame(maxWidth: .infinity).frame(height: 310)
                     } else {
-                        TreemapView(nodes: model.childNodes, selected: model.selected?.path, select: { model.selected = $0 }, open: { if $0.directory { model.scan($0.path) } else { model.reveal($0) } }, showAll: { model.showContents = true }).frame(height: 310)
+                        TreemapView(nodes: children, selected: model.selected?.path, select: { model.selected = $0 }, open: { if $0.directory { model.scan($0.path) } else { model.reveal($0) } }, showAll: { model.showContents = true }).frame(height: 310)
                     }
                     Text("Click a folder to drill in · Back to return · All items lists every child").font(.system(size: 10)).foregroundStyle(Palette.secondary)
                 }
             }.frame(maxWidth: .infinity)
             Panel(padding: 18) {
                 VStack(alignment: .leading, spacing: 13) {
-                    HStack { Text("Largest items").font(.system(size: 15, weight: .semibold)); Spacer(); Text("\(model.childNodes.count)").font(.system(size: 11)).foregroundStyle(Palette.secondary) }
+                    HStack { Text("Largest items").font(.system(size: 15, weight: .semibold)); Spacer(); Text("\(children.count)").font(.system(size: 11)).foregroundStyle(Palette.secondary) }
                     TextField("Filter this folder", text: $model.storageFilter).textFieldStyle(.roundedBorder).font(.system(size: 11))
                     HStack {
                         Picker("Order", selection: $model.storageSort) { ForEach(StorageSort.allCases, id: \.self) { Text($0.rawValue).tag($0) } }.labelsHidden()
@@ -231,10 +247,10 @@ struct StorageView: View {
                     }.font(.system(size: 10))
                     ScrollView {
                         LazyVStack(spacing: 0) {
-                            ForEach(Array(model.childNodes.enumerated()), id: \.element.id) { index, n in
+                            ForEach(Array(children.enumerated()), id: \.element.id) { index, n in
                                 Button { model.selected = n } label: {
                                     HStack(spacing: 9) {
-                                        RoundedRectangle(cornerRadius: 3).fill(Palette.tile(n.path)).frame(width: 6, height: 24)
+                                        AppIdentityIcon(path: n.path, size: 25, fallback: n.directory ? "folder.fill" : "doc")
                                         VStack(alignment: .leading, spacing: 4) { Text(n.name).font(.system(size: 11, weight: .medium)).lineLimit(1).truncationMode(.middle); Text(n.directory ? "\(n.files.formatted()) files" : "File").font(.system(size: 9)).foregroundStyle(Palette.secondary) }
                                         Spacer(minLength: 6)
                                         Text(byteText(n.bytes)).font(.system(size: 11, weight: .semibold, design: .monospaced))
@@ -268,7 +284,7 @@ struct StorageView: View {
             }
         }
         if model.skipped > 0 {
-            HStack { Image(systemName: "lock.shield").foregroundStyle(.orange); Text("\(model.skipped) locations couldn’t be read. Totals are partial.").font(.system(size: 11)); Spacer(); Button("See details") { model.showAccess = true }.buttonStyle(.plain).foregroundStyle(Palette.green).font(.system(size: 11, weight: .medium)) }
+            HStack { Image(systemName: "lock.shield").foregroundStyle(.orange); Text("\(model.skipped) items skipped · totals are partial. See the actual reasons.").font(.system(size: 11)); Spacer(); Button("See details") { model.showAccess = true }.buttonStyle(.plain).foregroundStyle(Palette.green).font(.system(size: 11, weight: .medium)) }
         }
         if !model.fileTypes.isEmpty { FileTypesPanel(totals: model.fileTypes) }
         GrowthLensPanel(model: model)
@@ -342,6 +358,7 @@ struct TreemapView: View {
                         RoundedRectangle(cornerRadius: 6).fill(Palette.tile(tile.node.path))
                         if tile.rect.width > 64 && tile.rect.height > 38 {
                             VStack(alignment: .leading, spacing: 6) {
+                                if tile.rect.height > 88, AppIdentity.bundlePath(for: tile.node.path) != nil { AppIdentityIcon(path: tile.node.path, size: tile.rect.width > 160 ? 30 : 22, fallback: "app.fill") }
                                 Text(tile.node.path == "__other__" ? "Other items" : tile.node.name).font(.system(size: tile.rect.width > 160 ? 13 : 10, weight: .semibold)).lineLimit(2).truncationMode(.middle)
                                 if tile.rect.height > 65 { Text(byteText(tile.node.bytes)).font(.system(size: tile.rect.width > 160 ? 19 : 12, weight: .medium, design: .rounded)).lineLimit(1) }
                             }.foregroundStyle(Color.white).padding(tile.rect.width > 100 ? 13 : 8)
@@ -361,6 +378,7 @@ struct TreemapView: View {
 struct Sparkline: View {
     let samples: [MemorySample]
     var growing = false
+    var accent: Color? = nil
     var body: some View {
         GeometryReader { g in
             Path { path in
@@ -371,7 +389,7 @@ struct Sparkline: View {
                     let p = CGPoint(x: CGFloat(i) / CGFloat(values.count - 1) * g.size.width, y: g.size.height - 3 - CGFloat((value - lo) / span) * (g.size.height - 6))
                     if i == 0 { path.move(to: p) } else { path.addLine(to: p) }
                 }
-            }.stroke(growing ? Color.orange : Palette.green, style: StrokeStyle(lineWidth: 1.6, lineJoin: .round))
+            }.stroke(growing ? Color.orange : (accent ?? Palette.green), style: StrokeStyle(lineWidth: 1.6, lineJoin: .round))
         }
     }
 }
@@ -412,14 +430,14 @@ struct MemoryView: View {
                 LazyVStack(spacing: 0) {
                     ForEach(memory.visibleRows.prefix(100)) { row in
                         HStack(spacing: 12) {
-                            Image(systemName: row.path.hasSuffix(".app") ? "app.fill" : "gearshape.fill").font(.system(size: 17)).foregroundStyle(Palette.green).frame(width: 25)
+                            AppIdentityIcon(path: row.path, size: 27, fallback: "gearshape.fill")
                             VStack(alignment: .leading, spacing: 4) {
                                 HStack { Text(row.name).font(.system(size: 12, weight: .medium)).lineLimit(1); if row.growing { Text("GROWING").font(.system(size: 7, weight: .bold)).padding(.horizontal, 5).padding(.vertical, 3).background(Color.orange.opacity(0.14)).foregroundStyle(Color.orange).clipShape(Capsule()) } }
                                 Text(row.processes.count > 1 ? "\(row.processes.count) processes" : "PID \(row.processes.first ?? 0)").font(.system(size: 9)).foregroundStyle(Palette.secondary)
                             }.frame(maxWidth: .infinity, alignment: .leading)
                             Text(byteText(row.bytes)).font(.system(size: 12, weight: .semibold, design: .monospaced)).frame(width: 95, alignment: .trailing)
                             Text(row.samples.count < 2 ? "—" : (row.delta < 0 ? "−" : "+") + byteText(abs(row.delta))).font(.system(size: 10, design: .monospaced)).foregroundStyle(row.growing ? .orange : Palette.secondary).frame(width: 95, alignment: .trailing)
-                            Sparkline(samples: row.samples, growing: row.growing).frame(width: 95, height: 29)
+                            Sparkline(samples: row.samples, growing: row.growing, accent: AppIdentity.color(for: row.path)).frame(width: 95, height: 29)
                             Button { memory.selected = row } label: { Image(systemName: "info.circle") }.buttonStyle(.plain).foregroundStyle(Palette.green).frame(width: 20).help("Inspect processes and memory history")
                             if row.path.hasSuffix(".app") && row.path != Bundle.main.bundleURL.path { Button("Quit") { memory.quit(row) }.buttonStyle(QuietButton()).frame(width: 62) }
                             else { Image(systemName: "lock").font(.system(size: 11)).foregroundStyle(Palette.secondary.opacity(0.5)).frame(width: 62) }
@@ -444,9 +462,8 @@ struct MemoryView: View {
 struct CleanupView: View {
     @ObservedObject var model: SweepModel
     @State private var cleanupQuery = ""
-    @State private var cleanupCategory = "All candidates"
     private var candidates: [FileNode] {
-        model.cleanupItems.filter { (cleanupQuery.isEmpty || $0.path.localizedCaseInsensitiveContains(cleanupQuery)) && (cleanupCategory == "All candidates" || $0.category == cleanupCategory) }
+        model.cleanupItems.filter { (cleanupQuery.isEmpty || $0.path.localizedCaseInsensitiveContains(cleanupQuery)) && (model.cleanupCategory == "All candidates" || $0.category == model.cleanupCategory) }
     }
     var body: some View {
         SectionTitle(eyebrow: "Staged file operations", title: "Cleanup Review", subtitle: "Inspect candidates, stage paths, and confirm moves to Trash")
@@ -454,6 +471,19 @@ struct CleanupView: View {
             Metric(icon: "tray", title: "Queued for review", value: byteText(model.queueBytes), note: "\(model.queue.count) items selected by you")
             Metric(icon: "trash", title: "Moved this session", value: byteText(model.freedThisSession), note: "Still in Trash until you empty it")
             Metric(icon: "checkmark.shield", title: "Cleanup method", value: "Trash first", note: "System folders and running apps protected")
+        }
+        if let bytes = model.trashBytes {
+            Panel(padding: 16) {
+                HStack {
+                    Image(systemName: "trash.fill").font(.system(size: 24)).foregroundStyle(.orange)
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("Already in Trash: \(byteText(bytes))").font(.system(size: 17, weight: .semibold))
+                        Text("These files still occupy space. Review them in Finder before choosing to empty Trash there.").font(.system(size: 11)).foregroundStyle(Palette.secondary)
+                    }
+                    Spacer()
+                    Button("Review Trash in Finder") { model.openTrash() }.buttonStyle(PrimaryButton())
+                }
+            }
         }
         Panel {
             HStack {
@@ -479,7 +509,7 @@ struct CleanupView: View {
                     Text("Cache cleanup signs you out of some offline features or makes apps download data again. Downloads can contain your only copy; review them in Finder.").font(.system(size: 11)).foregroundStyle(Palette.secondary)
                     HStack {
                         TextField("Filter candidate names or paths", text: $cleanupQuery).textFieldStyle(.roundedBorder)
-                        Picker("Category", selection: $cleanupCategory) { ForEach(["All candidates", "App cache", "Review download"], id: \.self) { Text($0).tag($0) } }.labelsHidden().frame(width: 160)
+                        Picker("Category", selection: $model.cleanupCategory) { ForEach(["All candidates", "App cache", "Review download"], id: \.self) { Text($0).tag($0) } }.labelsHidden().frame(width: 160)
                     }
                     ScrollView {
                     LazyVStack(spacing: 0) {
@@ -498,7 +528,12 @@ struct CleanupView: View {
                     }
                     }
                     }.frame(height: 420)
-                    Text("\(candidates.count) matching candidates · nothing is selected automatically").font(.system(size: 10)).foregroundStyle(Palette.secondary)
+                    HStack {
+                        Text("\(candidates.count) matching candidates · \(byteText(candidates.reduce(0) { $0 + $1.bytes })) to review").font(.system(size: 10)).foregroundStyle(Palette.secondary)
+                        Spacer()
+                        Button("Add shown items to review") { model.stageCandidates(candidates) }.buttonStyle(QuietButton()).disabled(candidates.isEmpty)
+                    }
+                    Text("Adding to review does not delete anything. Downloads may contain your only copy; inspect the queue before confirming Trash.").font(.system(size: 10)).foregroundStyle(Palette.secondary)
                 }
             }
         }
@@ -540,13 +575,19 @@ struct AccessView: View {
         VStack(alignment: .leading, spacing: 18) {
             Image(systemName: "lock.shield").font(.system(size: 28)).foregroundStyle(Palette.green)
             Text("Storage access").font(.system(size: 25, weight: .semibold, design: .rounded))
-            Text("macOS protects Mail, Messages, browser profiles and some Library folders. MiniSweep skips anything it cannot read and reports partial totals. For a complete scan, open Full Disk Access, add MiniSweep using the + button, then quit and reopen the app.").font(.system(size: 13)).foregroundStyle(Palette.secondary).fixedSize(horizontal: false, vertical: true)
+            Text("Full Disk Access is one layer of macOS permissions. File ownership, ACLs, protected system data and cloud-provider availability can still prevent reads. A skipped item does not by itself mean Full Disk Access is missing.").font(.system(size: 13)).foregroundStyle(Palette.secondary).fixedSize(horizontal: false, vertical: true)
             Text("MiniSweep only reads file names, metadata and process statistics. It has no network code, scheduled cleanup or background login agent.").font(.system(size: 12)).foregroundStyle(Palette.secondary)
+            if !model.scanErrorCounts.isEmpty {
+                ForEach(model.scanErrorCounts.keys.sorted(), id: \.self) { reason in
+                    HStack { Text(reason); Spacer(); Text("\(model.scanErrorCounts[reason] ?? 0)").monospacedDigit() }.font(.system(size: 11))
+                }
+            }
+            Text("For privacy-related errors, check that this signed MiniSweep app is enabled in Full Disk Access, then quit and reopen it. Online-only cloud items stay online; MiniSweep does not request their download. The scan stays on its starting filesystem; other volumes and APFS snapshots are outside its totals.").font(.system(size: 11)).foregroundStyle(Palette.secondary).fixedSize(horizontal: false, vertical: true)
             if !model.scanErrors.isEmpty {
-                ScrollView { Text(model.scanErrors.joined(separator: "\n")).font(.system(size: 9, design: .monospaced)).foregroundStyle(Palette.secondary).frame(maxWidth: .infinity, alignment: .leading) }.frame(height: 120)
+                ScrollView { Text(model.scanErrors.joined(separator: "\n")).font(.system(size: 9, design: .monospaced)).foregroundStyle(Palette.secondary).frame(maxWidth: .infinity, alignment: .leading) }.frame(height: 200)
             }
             HStack { Button("Done") { dismiss() }.buttonStyle(QuietButton()); Spacer(); Button("Open Full Disk Access") { model.openPermissions() }.buttonStyle(PrimaryButton()) }
-        }.padding(30).frame(width: 570).background(Palette.canvas)
+        }.padding(30).frame(width: 680).background(Palette.canvas)
     }
 }
 
@@ -563,6 +604,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     init() {
         if CommandLine.arguments.contains("--self-test") { exit(runSelfTests()) }
         if let index = CommandLine.arguments.firstIndex(of: "--scan-json"), CommandLine.arguments.count > index + 1 { exit(runScanCLI(CommandLine.arguments[index + 1])) }
+        if let index = CommandLine.arguments.firstIndex(of: "--benchmark-scan"), CommandLine.arguments.count > index + 1 { exit(runScanBenchmarkCLI(CommandLine.arguments[index + 1])) }
         if CommandLine.arguments.contains("--memory-json") { exit(runMemoryCLI()) }
         if CommandLine.arguments.contains("--trash-self-test") { exit(runTrashSelfTest()) }
     }

@@ -4,12 +4,30 @@
 #include <stddef.h>
 
 typedef struct MSScan MSScan;
+typedef struct {
+    int32_t device;
+    uint64_t inode;
+    int64_t length, modifiedSeconds, modifiedNanoseconds;
+    uint16_t mode;
+} MSFileIdentity;
+// lstat metadata without allowing cloud-file materialization. Returns errno or 0.
+int ms_path_identity(const char *path, MSFileIdentity *identity);
 typedef void (*MSScanCallback)(void *context, const char *path, int kind,
                               int64_t allocated, int64_t logical, uint64_t files, int error);
 MSScan *ms_scan_create(void);
 void ms_scan_cancel(MSScan *scan);
 void ms_scan_destroy(MSScan *scan);
+// Kinds: 1 finalized directory, 2 file, 3 global progress, 4 unreadable path,
+// 5 regular-file extension total, 6 provisional immediate-child directory total.
 int ms_scan_run(MSScan *scan, const char *root, int max_depth, MSScanCallback callback, void *context);
+// Reference implementation for correctness checks and repeatable benchmarks.
+int ms_scan_run_reference(MSScan *scan, const char *root, int max_depth, MSScanCallback callback, void *context);
+// Optional bulk metadata path, retained for filesystem-specific benchmarks.
+int ms_scan_run_bulk(MSScan *scan, const char *root, int max_depth, MSScanCallback callback, void *context);
+// Read immediate children only. Directory kind 1 values are own allocation,
+// with logical/files zero; callers must supply cached recursive totals.
+// Root and extension totals are omitted. Never follows a root symlink.
+int ms_scan_shallow(MSScan *scan, const char *root, MSScanCallback callback, void *context);
 
 typedef struct {
     int32_t pid, parent;

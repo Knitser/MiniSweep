@@ -2,7 +2,7 @@ import Foundation
 import Darwin
 
 func scanSynchronously(_ root: String, cancelled: Bool = false) -> (ScanCollector, Int32) {
-    let collector = ScanCollector { _, _, _, _, _ in }
+    let collector = ScanCollector { _ in }
     guard let handle = ms_scan_create() else { return (collector, ENOMEM) }
     if cancelled { ms_scan_cancel(handle) }
     let result = ms_scan_run(handle, root, 3, scanCallback, Unmanaged.passUnretained(collector).toOpaque())
@@ -13,6 +13,32 @@ func runScanCLI(_ path: String) -> Int32 {
     let report: [String: Any] = ["path": path, "result": code, "skipped": collector.skipped,
         "nodes": collector.nodes.map { ["path": $0.path, "allocated": $0.bytes, "logical": $0.logical, "files": $0.files, "directory": $0.directory] as [String: Any] }, "errors": collector.errors,
         "fileTypes": collector.fileTypes.values.sorted { $0.bytes > $1.bytes }.map { ["extension": $0.extensionName, "allocated": $0.bytes, "logical": $0.logical, "count": $0.count] as [String: Any] }]
+    if let data = try? JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys]) { print(String(decoding: data, as: UTF8.self)) }
+    return code == 0 ? 0 : 1
+}
+func runScanBenchmarkCLI(_ path: String) -> Int32 {
+    let index = StorageScanIndex(root: path)
+    let collector = ScanCollector(rootPath: path, index: index) { _ in }
+    guard let handle = ms_scan_create() else { return 1 }
+    defer { ms_scan_destroy(handle) }
+    let began = Date()
+    let code = ms_scan_run(handle, path, Int32.max, scanCallback, Unmanaged.passUnretained(collector).toOpaque())
+    let seconds = Date().timeIntervalSince(began)
+    index.finish(completed: code == 0, skipped: collector.skipped, rootIdentity: FileIdentity.read(path))
+    var navigationMilliseconds: Double? = nil
+    if let folder = collector.nodes.filter({ $0.directory && $0.parent == path && $0.path != path }).max(by: { $0.bytes < $1.bytes }),
+       let directories = index.indexedDirectoryChildren(of: folder.path) {
+        let navigationStart = Date()
+        let shallow = ScanCollector(rootPath: folder.path) { _ in }
+        if ms_scan_shallow(handle, folder.path, scanCallback, Unmanaged.passUnretained(shallow).toOpaque()) == 0,
+           Set(shallow.nodes.filter(\.directory).map(\.path)) == Set(directories.map(\.path)) {
+            navigationMilliseconds = Date().timeIntervalSince(navigationStart) * 1000
+        }
+    }
+    var report: [String: Any] = ["seconds": seconds, "result": code, "skipped": collector.skipped,
+        "files": collector.nodes.first(where: { $0.path == path })?.files ?? 0,
+        "indexedEntries": index.entryCount, "estimatedIndexBytes": index.estimatedBytes, "indexLimited": index.isTruncated]
+    if let milliseconds = navigationMilliseconds { report["largestFolderNavigationMilliseconds"] = milliseconds }
     if let data = try? JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys]) { print(String(decoding: data, as: UTF8.self)) }
     return code == 0 ? 0 : 1
 }
@@ -83,7 +109,7 @@ func runTrashSelfTest() -> Int32 {
         check(scan.fileTypes["bin"]?.count == 2, "file type totals include nested small and sparse files")
         check(scan.fileTypes["bin"]?.logical == 103 * 1024 * 1024, "file type logical totals preserve sparse-file lengths")
         check(scan.fileTypes.values.reduce(UInt64(0)) { $0 + $1.count } == 2, "file type totals exclude symbolic links and their targets")
-        let manyTypes = ScanCollector { _, _, _, _, _ in }
+        let manyTypes = ScanCollector { _ in }
         for i in 0..<1000 { manyTypes.event(path: "type\(i)", kind: 5, allocated: 10, logical: 10, files: 1, error: 0) }
         check(manyTypes.fileTypes.count <= 513 && manyTypes.fileTypes.values.reduce(UInt64(0)) { $0 + $1.count } == 1000, "rare file types are bounded without losing total counts")
         let (_, cancelled) = scanSynchronously(downloads.path, cancelled: true)
@@ -173,6 +199,7 @@ func runTrashSelfTest() -> Int32 {
         let dockerDisk = "/fixture/Library/Containers/com.docker.docker/Data/vms/0/data"
         check(vmContext(dockerDisk + "/Docker.raw").1 == dockerDisk, "Docker disk attribution identifies the VM data directory")
         check(vmContext(dockerDisk + "/Docker.raw.log").1.isEmpty, "logs named after a disk image are not classified as backing disks")
+        try runStoragePerformanceChecks({ result, name in check(result, name) }, directory: temp)
     } catch { failures.append(error.localizedDescription) }
     print("MiniSweep: \(checks - failures.count)/\(checks) checks passed")
     for failure in failures { print("FAIL: " + failure) }

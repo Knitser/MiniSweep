@@ -33,7 +33,7 @@ struct FolderContentsView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var query = ""
     private var items: [FileNode] {
-        model.nodes.filter { $0.parent == model.root && (query.isEmpty || $0.name.localizedCaseInsensitiveContains(query)) }
+        model.nodes.filter { $0.path != model.root && $0.parent == model.root && (query.isEmpty || $0.name.localizedCaseInsensitiveContains(query)) }
             .sorted { $0.bytes == $1.bytes ? $0.path < $1.path : $0.bytes > $1.bytes }
     }
     var body: some View {
@@ -56,7 +56,7 @@ struct FolderContentsView: View {
                             dismiss()
                         } label: {
                             HStack(spacing: 12) {
-                                Image(systemName: n.directory ? "folder.fill" : "doc").foregroundStyle(Palette.tile(n.path)).frame(width: 20)
+                                AppIdentityIcon(path: n.path, size: 23, fallback: n.directory ? "folder.fill" : "doc")
                                 Text(n.name).font(.system(size: 12, weight: .medium)).lineLimit(1).truncationMode(.middle).frame(maxWidth: .infinity, alignment: .leading)
                                 Text(n.directory ? n.files.formatted() : "—").font(.system(size: 10, design: .monospaced)).foregroundStyle(Palette.secondary).frame(width: 95, alignment: .trailing)
                                 Text(byteText(n.bytes)).font(.system(size: 11, weight: .semibold, design: .monospaced)).frame(width: 95, alignment: .trailing)
@@ -209,7 +209,7 @@ struct MemoryInspector: View {
         VStack(alignment: .leading, spacing: 18) {
             HStack {
                 VStack(alignment: .leading, spacing: 7) {
-                    Text(row.name).font(.system(size: 26, weight: .semibold, design: .rounded))
+                    HStack(spacing: 12) { AppIdentityIcon(path: row.path, size: 42, fallback: "gearshape.fill"); Text(row.name).font(.system(size: 26, weight: .semibold, design: .rounded)) }
                     Text(available ? "LIVE PROCESS DETAILS · \(row.processes.count) PROCESSES" : "LAST SAMPLE · NO LONGER OBSERVABLE").font(.system(size: 9, weight: .semibold)).tracking(1.3).foregroundStyle(Palette.green)
                 }
                 Spacer()

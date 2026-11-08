@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.3.0 — 2026-11-09
+
+- Reuse completed scans for folder navigation, with separately bounded directory and file metadata budgets.
+- Read only immediate files when an indexed folder exceeds the file-list cache, avoiding repeated nested scans.
+- Restore dated, private saved overviews while refreshing in the background.
+- Show provisional top-level branch totals during scans and batch file-type updates.
+- Keep online-only cloud items online and report skipped items by actual error category.
+- Add Find space guidance, existing Trash size, direct cleanup actions and batch staging for final review.
+- Show real app icons with icon-derived map colors and memory accents.
+- Prevent dated cached storage views from creating fresh baselines or staging cleanup.
+- Verify 55 checks, including full/reference/bulk scanner parity and shallow navigation.
+
 ## 1.2.0 — 2026-11-09
 
 - Storage Growth Lens compares complete scans against saved local baselines and identifies added, removed, grown and shrunken paths.

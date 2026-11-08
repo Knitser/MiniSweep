@@ -4,8 +4,8 @@ project="${0:A:h}"
 destination="${1:-$project/dist}"
 build="$project/build"
 app="$destination/MiniSweep.app"
-release_version="${MINISWEEP_VERSION:-1.2.0}"
-build_number="${MINISWEEP_BUILD_NUMBER:-4}"
+release_version="${MINISWEEP_VERSION:-1.3.0}"
+build_number="${MINISWEEP_BUILD_NUMBER:-5}"
 signing_identity="${MINISWEEP_SIGNING_IDENTITY:-}"
 if [[ ! "$release_version" =~ '^[0-9]+\.[0-9]+\.[0-9]+$' || ! "$build_number" =~ '^[1-9][0-9]*$' ]]; then
     print -u2 "Use a numeric release version (for example, 1.0.1) and positive build number."
@@ -20,7 +20,7 @@ xcrun clang -O2 -mmacosx-version-min=14.0 -ffile-prefix-map="$project"=. -fdebug
 xcrun swiftc -swift-version 5 -O -whole-module-optimization -target arm64-apple-macosx14.0 \
     -module-name MiniSweep -file-prefix-map "$project"=. -debug-prefix-map "$project"=. \
     -module-cache-path "$build/ModuleCache" -import-objc-header "$project/Sources/Engine.h" \
-    "$project/Sources/Services.swift" "$project/Sources/App.swift" "$project/Sources/Details.swift" "$project/Sources/GrowthLens.swift" "$project/Sources/Tests.swift" \
+    "$project/Sources/Services.swift" "$project/Sources/App.swift" "$project/Sources/Details.swift" "$project/Sources/GrowthLens.swift" "$project/Sources/ScanIndex.swift" "$project/Sources/ScanOverview.swift" "$project/Sources/AppIdentity.swift" "$project/Sources/SpaceGuide.swift" "$project/Sources/PerformanceTests.swift" "$project/Sources/Tests.swift" \
     "$build/Engine.o" -framework SwiftUI -framework AppKit -o "$app/Contents/MacOS/MiniSweep"
 cat > "$app/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>

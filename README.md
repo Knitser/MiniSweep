@@ -10,6 +10,9 @@ Built by [knitser](https://github.com/Knitser).
 
 ## Features
 
+- **Fast navigation:** reuse indexed folder totals after a scan. When file metadata exceeds the memory budget, drill-down reads only immediate children instead of walking the nested tree again. Saved overviews appear immediately while a fresh scan runs.
+- **Find space:** a clear route from Storage to caches and downloads, category filters, existing Trash space and batch staging into the final cleanup review.
+- **App identity:** real macOS app icons and icon-derived map colors and memory accents.
 - **Storage map:** single-click folder drill-down, Back/Forward navigation, a full folder-contents browser, configurable sorting, and large-file filtering. Every subfolder remains accessible, including items grouped into smaller blocks.
 - **File details:** allocated versus logical size, nested file counts, timestamps, ownership, permissions, path copying, and file-type totals from the full scan.
 - **Native appearance:** dark mode by default, native Liquid Glass on macOS 26 or later, material effects on earlier versions, and Aurora, Ocean and Copper map palettes. Light and system appearance remain available.
@@ -29,13 +32,19 @@ Built by [knitser](https://github.com/Knitser).
 
 The current release is signed with Developer ID and notarized by Apple. Notarization tickets are attached for offline verification. macOS may still show its normal first-open confirmation for an app downloaded from the internet. You can also build the app locally using the instructions below.
 
-For a complete storage scan, use **Disk access & permissions** to open Full Disk Access in System Settings, add MiniSweep, then quit and reopen it. Folders macOS will not let the app read are skipped and reported, so totals may be partial.
+Use **Disk access & permissions** to inspect the actual reasons items were skipped. Enable the signed MiniSweep app in Full Disk Access in System Settings, then quit and reopen it. Full Disk Access does not override every filesystem permission, ACL or system protection. Online-only cloud items remain online, changed files are distinguished from permission errors, and totals may be partial.
 
 ## Storage explorer
 
 Choose Home, Applications, Downloads, Caches, All data, or a custom folder or mounted volume. Bigger blocks mean larger items. Single-click a folder block to scan inside it. Back and Forward return through folder history. Use All items or click the Other items block to browse every item in the current folder. Click a file block to select it, then open Details for metadata. **Reveal** opens the selected item in Finder. **Add to review** queues a permitted item without moving it.
 
-Scanning runs in the background, reports progress and can be stopped. Directory symlinks are not followed, and scans stay on the starting filesystem. Sparse files are measured by allocated blocks rather than apparent length. APFS clones and hard links can share blocks, so per-path totals are estimates and may exceed the space a cleanup would reclaim.
+The first scan still enumerates readable metadata; it is not an instant or raw APFS volume index. Scanning runs in the background, shows provisional top-level totals before large branches finish, reports progress and can be stopped. File-type totals are batched before being passed to the interface. Cloud materialization is disabled for scanner metadata operations so scans do not request downloads of online-only files or directories. The default traversal was retained after bulk enumeration benchmarks did not show a consistent improvement.
+
+Completed scans retain a bounded navigation index (up to 200,000 entries and a 64 MiB estimated metadata budget), reserving directory capacity separately from file listings. Once the file budget fills, folder navigation can still combine indexed recursive folder totals with a shallow read of immediate files. Uncached or structurally changed folders require a new scan. Dated cached views cannot create fresh Growth Lens baselines or stage storage cleanup; refresh first or use fresh cleanup candidates.
+
+Up to three root overviews, containing names, metadata, top file summaries and error samples, are saved locally within 4 MiB. Their files use owner-only permissions. On reopening, the last overview appears with its timestamp while refreshing. Use **Forget saved overviews** to clear them. These snapshots contain local paths and are never uploaded.
+
+Directory symlinks are not followed, and scans stay on the starting filesystem. The All data target covers the writable Data volume; other mounted filesystems, snapshots and other APFS volumes are outside that path total, even though the disk meter shows container space. Sparse files are measured by allocated blocks rather than apparent length. APFS clones and hard links can share blocks, so per-path totals are estimates and may exceed the space a cleanup would reclaim.
 
 ## Memory monitor
 
@@ -61,7 +70,7 @@ VM images and session state are workload data. These links are for storage inspe
 
 ## Cleanup
 
-**Find cleanup** checks recognized app caches, temporary package downloads and Downloads. Nothing is selected automatically. Inspect each item before adding it to review, then confirm the final queue.
+**Find cleanup** checks recognized app caches, temporary package downloads and Downloads. Nothing is selected automatically. Inspect each item before adding it to review, then confirm the final queue. **Add shown items to review** stages the currently filtered candidates as a batch; it does not move or delete them.
 
 Downloads can contain your only copy of a file. Apps may need to download data again after cache cleanup. Close related apps before proceeding.
 
@@ -97,13 +106,14 @@ dist/MiniSweep.app/Contents/MacOS/MiniSweep --self-test
 dist/MiniSweep.app/Contents/MacOS/MiniSweep --trash-self-test
 ```
 
-The first command runs 50 checks covering size aggregation, sparse files, symlinks, cancellation, cleanup boundaries, file replacement and in-place edits, bounded file-type aggregation, growth thresholds, extreme treemap layouts, persisted size comparisons, partial-scan safeguards and VM backing-file classification. The second creates a disposable file, moves it to Trash, restores it intact and removes only its own fixture.
+The first command runs 55 checks covering size aggregation, sparse files, symlinks, cancellation, cleanup boundaries, file replacement and in-place edits, bounded file-type aggregation, growth thresholds, extreme treemap layouts, persisted size comparisons, partial-scan safeguards, scanner parity, bounded index coverage, shallow navigation, saved overview privacy and VM backing-file classification. The second creates a disposable file, moves it to Trash, restores it intact and removes only its own fixture.
 
 Read-only diagnostics are also available:
 
 ```sh
 dist/MiniSweep.app/Contents/MacOS/MiniSweep --scan-json /path/to/folder
 dist/MiniSweep.app/Contents/MacOS/MiniSweep --memory-json
+dist/MiniSweep.app/Contents/MacOS/MiniSweep --benchmark-scan /path/to/folder
 ```
 
 These commands use the terminal's permissions, which can differ from the app's. Their JSON output contains local paths or process names and is not uploaded by the app.

@@ -11,13 +11,13 @@ func byteText(_ value: Int64) -> String {
     if n >= 1024 { return String(format: "%.0f KiB", n / 1024) }
     return "\(Int(n)) B"
 }
-func shortPath(_ path: String) -> String { path == sweepHome ? "~" : path.replacingOccurrences(of: sweepHome + "/", with: "~/") }
+func shortPath(_ path: String) -> String { path == sweepHome ? "~" : path.hasPrefix(sweepHome + "/") ? "~" + path.dropFirst(sweepHome.count) : path }
 func inside(_ path: String, _ root: String) -> Bool { path == root || path.hasPrefix(root + "/") }
 func cString<T>(_ tuple: T) -> String {
     withUnsafePointer(to: tuple) { p in p.withMemoryRebound(to: CChar.self, capacity: MemoryLayout<T>.size) { String(cString: $0) } }
 }
 
-struct FileNode: Identifiable, Hashable {
+struct FileNode: Identifiable, Hashable, Codable {
     var id: String { path }
     let path: String
     let bytes: Int64
@@ -25,11 +25,14 @@ struct FileNode: Identifiable, Hashable {
     let files: UInt64
     let directory: Bool
     var category: String = ""
-    var name: String { URL(fileURLWithPath: path).lastPathComponent }
-    var parent: String { URL(fileURLWithPath: path).deletingLastPathComponent().path }
+    var name: String { path.split(separator: "/").last.map(String.init) ?? "/" }
+    var parent: String {
+        guard let slash = path.lastIndex(of: "/"), slash != path.startIndex else { return "/" }
+        return String(path[..<slash])
+    }
 }
 
-struct FileTypeTotal: Identifiable {
+struct FileTypeTotal: Identifiable, Codable {
     let extensionName: String
     var bytes: Int64 = 0
     var logical: Int64 = 0
@@ -52,16 +55,44 @@ struct DiskStatus {
     }
 }
 
+struct ScanProgress {
+    let nodes: [FileNode]
+    let bytes: Int64
+    let files: UInt64
+    let path: String
+    let skipped: Int
+    let errorCounts: [String: Int]
+    let errors: [String]
+    let trashBytes: Int64?
+}
+func scanErrorCategory(_ code: Int32) -> String {
+    switch code {
+    case EACCES: return "File permissions / ACLs"
+    case EPERM: return "macOS protection"
+    case EDEADLK: return "Cloud items left online"
+    case ENOENT, ENOTDIR, ESTALE: return "Changed during scan"
+    case ELOOP: return "Cycle or link skipped"
+    case EIO, ETIMEDOUT, ENXIO: return "Storage or provider error"
+    default: return "Other scan errors"
+    }
+}
 // Written only by its scan worker; final values are handed to the main queue after the worker returns.
 final class ScanCollector: @unchecked Sendable {
     var nodes: [FileNode] = []
     var largest: [FileNode] = []
     var errors: [String] = []
     var skipped = 0
+    var errorCounts: [String: Int] = [:]
+    var trashBytes: Int64?
     var fileTypes: [String: FileTypeTotal] = [:]
+    private var rootItems: [String: FileNode] = [:]
+    private var errorSamples: [String: Int] = [:]
+    let index: StorageScanIndex?
     let rootPath: String?
-    let progress: ([FileNode], Int64, UInt64, String, Int) -> Void
-    init(rootPath: String? = nil, progress: @escaping ([FileNode], Int64, UInt64, String, Int) -> Void) { self.rootPath = rootPath; self.progress = progress }
+    let progress: (ScanProgress) -> Void
+    init(rootPath: String? = nil, index: StorageScanIndex? = nil, progress: @escaping (ScanProgress) -> Void) {
+        self.rootPath = rootPath; self.index = index; self.progress = progress
+    }
     func event(path: String, kind: Int32, allocated: Int64, logical: Int64, files: UInt64, error: Int32) {
         if kind == 5 {
             var ext = path.lowercased()
@@ -71,19 +102,29 @@ final class ScanCollector: @unchecked Sendable {
             fileTypes[ext] = value
             return
         }
-        if kind == 1 || kind == 2 {
-            let n = FileNode(path: path, bytes: allocated, logical: logical, files: files, directory: kind == 1)
+        if kind == 1 || kind == 2 || kind == 6 {
+            let n = FileNode(path: path, bytes: allocated, logical: logical, files: files, directory: kind != 2)
+            if kind == 6 { if n.parent == rootPath { rootItems[path] = n }; return }
+            index?.append(n)
+            if kind == 1 && path == sweepHome + "/.Trash" { trashBytes = allocated }
             // Keep every direct child, even when large nested files are discovered first.
-            if kind == 1 || rootPath == nil || n.parent == rootPath { nodes.append(n) }
+            if rootPath == nil || n.parent == rootPath || path == rootPath { nodes.append(n) }
+            if n.parent == rootPath { rootItems[path] = n }
             if kind == 2 && allocated >= 8 * 1024 * 1024 {
                 largest.append(n)
                 if largest.count > 250 { largest.sort { $0.bytes > $1.bytes }; largest = Array(largest.prefix(150)) }
             }
         } else if kind == 3 {
-            progress(nodes, allocated, files, path, skipped)
+            progress(ScanProgress(nodes: rootPath == nil ? nodes : Array(rootItems.values), bytes: allocated, files: files, path: path, skipped: skipped, errorCounts: errorCounts, errors: errors, trashBytes: trashBytes))
         } else if kind == 4 {
             skipped += 1
-            if errors.count < 100 { errors.append("\(shortPath(path)): \(String(cString: strerror(error)))") }
+            index?.recordError(at: path)
+            let category = scanErrorCategory(error)
+            errorCounts[category, default: 0] += 1
+            if errorSamples[category, default: 0] < 12 && errors.count < 100 {
+                errors.append("[\(category) · errno \(error)] \(shortPath(path)): \(String(cString: strerror(error)))")
+                errorSamples[category, default: 0] += 1
+            }
         }
     }
 }
@@ -101,7 +142,7 @@ let scanCallback: MSScanCallback = { context, path, kind, allocated, logical, fi
     Unmanaged<ScanCollector>.fromOpaque(context).takeUnretainedValue().event(path: String(cString: path), kind: kind, allocated: allocated, logical: logical, files: files, error: error)
 }
 
-struct FileIdentity: Equatable {
+struct FileIdentity: Equatable, Codable {
     let device: Int32
     let inode: UInt64
     let length: Int64
@@ -109,10 +150,10 @@ struct FileIdentity: Equatable {
     let modifiedNanoseconds: Int64
     let mode: UInt16
     static func read(_ path: String) -> FileIdentity? {
-        var s = stat()
-        guard lstat(path, &s) == 0 else { return nil }
-        return FileIdentity(device: s.st_dev, inode: s.st_ino, length: s.st_size,
-                            modifiedSeconds: Int64(s.st_mtimespec.tv_sec), modifiedNanoseconds: Int64(s.st_mtimespec.tv_nsec), mode: s.st_mode)
+        var value = MSFileIdentity()
+        guard ms_path_identity(path, &value) == 0 else { return nil }
+        return FileIdentity(device: value.device, inode: value.inode, length: value.length,
+                            modifiedSeconds: value.modifiedSeconds, modifiedNanoseconds: value.modifiedNanoseconds, mode: value.mode)
     }
 }
 struct QueueEntry: Identifiable {
@@ -162,6 +203,11 @@ struct CleanupPolicy {
     @Published var scanPath = ""
     @Published var skipped = 0
     @Published var scanErrors: [String] = []
+    @Published var scanErrorCounts: [String: Int] = [:]
+    @Published var overviewDate: Date?
+    @Published var overviewSource = ""
+    @Published var isSavedOverview = false
+    @Published var indexNotice = ""
     @Published var elapsed: TimeInterval = 0
     @Published var selected: FileNode?
     @Published var showContents = false
@@ -176,12 +222,21 @@ struct CleanupPolicy {
     @Published var growthNotice = ""
     var latestSnapshot: StorageBaseline?
     let growthStore: GrowthLensStore
-    init(growthStore: GrowthLensStore? = nil) { self.growthStore = growthStore ?? GrowthLensStore() }
+    let overviewStore: ScanOverviewStore
+    var scanIndex: StorageScanIndex?
+    var sessionOverview: ScanOverview?
+    init(growthStore: GrowthLensStore? = nil, overviewStore: ScanOverviewStore? = nil) {
+        self.growthStore = growthStore ?? GrowthLensStore()
+        self.overviewStore = overviewStore ?? ScanOverviewStore()
+    }
+    func startStorage() { scan(overviewStore.latestRoot ?? root, forceRefresh: true) }
     @Published var queue: [QueueEntry] = []
     @Published var showReview = false
     @Published var showAccess = false
     @Published var alert: String?
+    @Published var trashBytes: Int64?
     @Published var cleanupItems: [FileNode] = []
+    @Published var cleanupCategory = "All candidates"
     @Published var findingCleanup = false
     @Published var cleanupNote = ""
     @Published var trashBusy = false
@@ -194,7 +249,7 @@ struct CleanupPolicy {
     var start = Date()
     var cleanupHandle: ScanHandle?
     var childNodes: [FileNode] {
-        let items = nodes.filter { $0.parent == root && (storageFilter.isEmpty || $0.name.localizedCaseInsensitiveContains(storageFilter)) &&
+        let items = nodes.filter { $0.path != root && $0.parent == root && (storageFilter.isEmpty || $0.name.localizedCaseInsensitiveContains(storageFilter)) &&
             (storageKind == "All items" || (storageKind == "Folders" ? $0.directory : !$0.directory)) }
         return items.sorted {
             switch storageSort {
@@ -214,43 +269,132 @@ struct CleanupPolicy {
         p.message = "Choose a folder or volume to map. MiniSweep reads sizes without opening file contents."
         if p.runModal() == .OK, let url = p.url { scan(url.path) }
     }
-    func scan(_ path: String? = nil, recordHistory: Bool = true) {
-        scanHandle?.cancel()
+    func showOverview(_ snapshot: ScanOverview, saved: Bool) {
+        nodes = snapshot.nodes; largest = snapshot.largest; fileTypes = snapshot.fileTypes
+        if let trash = snapshot.nodes.first(where: { $0.path == sweepHome + "/.Trash" }) { trashBytes = trash.bytes }
+        skipped = snapshot.skipped; scanErrors = snapshot.errors; scanErrorCounts = snapshot.errorCounts ?? [:]
+        elapsed = snapshot.elapsed; scanBytes = snapshot.nodes.first(where: { $0.path == root })?.bytes ?? 0
+        scannedFiles = snapshot.nodes.first(where: { $0.path == root })?.files ?? 0
+        overviewDate = snapshot.date; overviewSource = saved ? "Saved overview" : "Indexed scan"
+        isSavedOverview = saved; scanComplete = false
+        growthNotice = "Refresh this folder to make a new Growth Lens comparison. Displayed sizes come from the dated scan."
+    }
+    func scan(_ path: String? = nil, recordHistory: Bool = true, forceRefresh: Bool = false) {
         let newRoot = URL(fileURLWithPath: path ?? root).standardizedFileURL.path
-        guard FileManager.default.fileExists(atPath: newRoot) else { alert = "This folder is no longer available."; return }
+        let identity = FileIdentity.read(newRoot)
+        guard let identity, identity.mode & 0o170000 == 0o040000 else { alert = "This folder is no longer available or cannot be read."; return }
+        scanHandle?.cancel(); scanHandle = nil; scanID = UUID(); let id = scanID
         if recordHistory && (navigationIndex < 0 || navigation[navigationIndex] != newRoot) {
             navigation = Array(navigation.prefix(navigationIndex + 1)); navigation.append(newRoot)
             if navigation.count > 50 { navigation.removeFirst() }
             navigationIndex = navigation.count - 1
         }
-        root = newRoot; scanID = UUID(); let id = scanID
-        growthComparison = nil; latestSnapshot = nil; growthNotice = "Comparing after this scan finishes…"
-        nodes = []; largest = []; selected = nil; fileTypes = []; largestFilter = ""; scanErrors = []; skipped = 0; scannedFiles = 0; scanBytes = 0
-        storageFilter = ""; isScanning = true; scanComplete = false; start = Date(); elapsed = 0
-        guard let handle = ScanHandle() else { isScanning = false; alert = "Could not start the scanner."; return }
-        scanHandle = handle
-        let collector = ScanCollector(rootPath: newRoot) { [weak self] partial, bytes, files, active, skipped in
-            let children = partial.filter { $0.parent == newRoot || $0.path == newRoot }
-            DispatchQueue.main.async {
-                guard let self, self.scanID == id else { return }
-                self.nodes = children; self.scanBytes = bytes; self.scannedFiles = files; self.scanPath = active
-                self.skipped = skipped; self.elapsed = Date().timeIntervalSince(self.start)
+        root = newRoot; selected = nil; storageFilter = ""; largestFilter = ""
+        growthComparison = nil; latestSnapshot = nil; isScanning = false; scanComplete = false
+        overviewDate = nil; overviewSource = ""; isSavedOverview = false; indexNotice = ""
+        let refresh = forceRefresh || path == nil
+        if !refresh, let index = scanIndex, index.matchesRootIdentity(FileIdentity.read(index.root)) {
+            if let snapshot = sessionOverview, snapshot.root == newRoot {
+                showOverview(snapshot, saved: false)
+                indexNotice = index.isTruncated ? "Navigation index reached its memory budget. Uncached folders scan when opened." : "Open folders instantly from this scan. Refresh checks disk changes."
+                return
+            }
+            if let folder = index.node(at: newRoot) {
+                if let children = index.indexedChildren(of: newRoot) {
+                    showIndexedFolder(folder, children: children, index: index)
+                    return
+                }
+                if let directories = index.indexedDirectoryChildren(of: newRoot) {
+                    showIndexedFolder(folder, children: directories, index: index)
+                    loadIndexedFiles(folder, directories: directories, index: index, identity: identity, id: id)
+                    return
+                }
             }
         }
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            let code = ms_scan_run(handle.pointer, newRoot, 1, scanCallback, Unmanaged.passUnretained(collector).toOpaque())
+        nodes = []; largest = []; fileTypes = []; scanErrors = []; scanErrorCounts = [:]
+        skipped = 0; scannedFiles = 0; scanBytes = 0; elapsed = 0
+        if let snapshot = overviewStore.overview(for: newRoot, identity: identity) { showOverview(snapshot, saved: true) }
+        isScanning = true; start = Date(); scanPath = newRoot
+        growthNotice = "Comparing after this scan finishes…"
+        guard let handle = ScanHandle() else { isScanning = false; alert = "Could not start the scanner."; return }
+        scanHandle = handle
+        let index = StorageScanIndex(root: newRoot)
+        let collector = ScanCollector(rootPath: newRoot, index: index) { [weak self] progress in
+            DispatchQueue.main.async {
+                guard let self, self.scanID == id else { return }
+                if !self.isSavedOverview {
+                    self.nodes = progress.nodes; self.scanBytes = progress.bytes; self.scannedFiles = progress.files
+                    self.skipped = progress.skipped; self.scanErrorCounts = progress.errorCounts; self.scanErrors = progress.errors
+                }
+                self.scanPath = progress.path
+                if let bytes = progress.trashBytes { self.trashBytes = bytes }
+                self.elapsed = Date().timeIntervalSince(self.start)
+            }
+        }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let code = ms_scan_run(handle.pointer, newRoot, Int32.max, scanCallback, Unmanaged.passUnretained(collector).toOpaque())
+            let endIdentity = FileIdentity.read(newRoot)
+            let stable = endIdentity?.device == identity.device && endIdentity?.inode == identity.inode
+            let completed = code == 0 && stable
+            index.finish(completed: completed, skipped: collector.skipped, rootIdentity: stable ? identity : nil)
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.scanID == id else { return }
                 self.scanHandle = nil; self.isScanning = false
-                self.nodes = collector.nodes; self.largest = Array(collector.largest.sorted { $0.bytes > $1.bytes }.prefix(100))
-                self.fileTypes = collector.fileTypes.values.sorted { $0.bytes > $1.bytes }
-                self.skipped = collector.skipped; self.scanErrors = collector.errors
+                // A cancelled refresh retains the clearly dated saved overview.
+                if code != ECANCELED || !self.isSavedOverview {
+                    self.nodes = collector.nodes; self.largest = Array(collector.largest.sorted { $0.bytes > $1.bytes }.prefix(100))
+                    self.fileTypes = collector.fileTypes.values.sorted { $0.bytes > $1.bytes }
+                    self.skipped = collector.skipped; self.scanErrors = collector.errors; self.scanErrorCounts = collector.errorCounts
+                    self.isSavedOverview = false; self.overviewDate = nil; self.overviewSource = ""
+                    if let bytes = collector.trashBytes { self.trashBytes = bytes }
+                }
                 self.elapsed = Date().timeIntervalSince(self.start); self.disk = DiskStatus.read()
-                self.scanComplete = code == 0
+                self.scanComplete = completed
+                if completed {
+                    self.scanIndex = index
+                    self.indexNotice = index.isTruncated ? "Navigation index reached its memory budget. Uncached folders scan when opened." : "Scan indexed. Opening subfolders and going Back reuses these results."
+                    let snapshot = ScanOverview(root: newRoot, date: index.scannedAt, identity: identity, nodes: self.nodes, largest: self.largest, fileTypes: self.fileTypes, skipped: self.skipped, errorCounts: self.scanErrorCounts, errors: self.scanErrors, elapsed: self.elapsed)
+                    self.sessionOverview = snapshot
+                    do { try self.overviewStore.save(snapshot) } catch { self.indexNotice += " This overview could not be saved locally." }
+                }
                 self.updateGrowthLens()
+                if !stable { self.growthNotice = "The folder or volume changed during the scan. Refresh to compare it." }
                 if code != 0 && code != ECANCELED { self.alert = "Scan stopped: \(String(cString: strerror(code)))." }
             }
         }
+    }
+    func showIndexedFolder(_ folder: FileNode, children: [FileNode], index: StorageScanIndex) {
+        nodes = [folder] + children; largest = index.largeFiles(in: folder.path); fileTypes = []
+        skipped = index.skipped; scanErrors = sessionOverview?.errors ?? []; scanErrorCounts = sessionOverview?.errorCounts ?? [:]
+        scanBytes = folder.bytes; scannedFiles = folder.files; overviewDate = index.scannedAt; overviewSource = "Indexed scan"
+        growthNotice = "Folder totals come from the indexed scan. Refresh this folder for current totals and a new Growth Lens comparison."
+        indexNotice = "Folder navigation reuses the scan. Any skipped-item counts refer to that original scan."
+    }
+    func loadIndexedFiles(_ folder: FileNode, directories: [FileNode], index: StorageScanIndex, identity: FileIdentity, id: UUID) {
+        guard let handle = ScanHandle() else { scan(folder.path, recordHistory: false, forceRefresh: true); return }
+        scanHandle = handle; isScanning = true; scanPath = folder.path
+        indexNotice = "Loading immediate file metadata; nested folders are already indexed."
+        let collector = ScanCollector(rootPath: folder.path) { _ in }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let code = ms_scan_shallow(handle.pointer, folder.path, scanCallback, Unmanaged.passUnretained(collector).toOpaque())
+            let current = FileIdentity.read(folder.path)
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.scanID == id else { return }
+                self.isScanning = false; self.scanHandle = nil
+                if code == ECANCELED { self.indexNotice = "Stopped loading files. Refresh to complete this view."; return }
+                let presentDirectories = Set(collector.nodes.filter(\.directory).map(\.path))
+                if code != 0 || collector.skipped > 0 || current?.device != identity.device || current?.inode != identity.inode || presentDirectories != Set(directories.map(\.path)) {
+                    self.scan(folder.path, recordHistory: false, forceRefresh: true)
+                    return
+                }
+                self.showIndexedFolder(folder, children: directories + collector.nodes.filter { !$0.directory }, index: index)
+                self.indexNotice = "Folder totals reused from the scan; immediate files checked without rescanning nested folders. Refresh updates all totals."
+            }
+        }
+    }
+    func forgetOverviews() {
+        do { try overviewStore.removeAll(); indexNotice = "Saved overviews cleared from this Mac." }
+        catch { alert = "Could not clear the saved overviews." }
     }
     func stopScan() { scanHandle?.cancel() }
     func updateGrowthLens() {
@@ -283,7 +427,10 @@ struct CleanupPolicy {
         navigationIndex = next; scan(navigation[next], recordHistory: false)
     }
     func reveal(_ n: FileNode) { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: n.path)]) }
-    func refusal(_ n: FileNode) -> String? { policy.refusal(n.path, runningBundles: runningBundles) }
+    func refusal(_ n: FileNode) -> String? {
+        if overviewDate != nil && n.category.isEmpty { return "Refresh this dated scan before staging cleanup, or use the fresh cleanup review." }
+        return policy.refusal(n.path, runningBundles: runningBundles)
+    }
     func addToQueue(_ n: FileNode) {
         if let reason = refusal(n) { alert = reason; return }
         if queue.contains(where: { inside(n.path, $0.node.path) }) { return }
@@ -291,22 +438,43 @@ struct CleanupPolicy {
         queue.removeAll { inside($0.node.path, n.path) }
         queue.append(QueueEntry(node: n, identity: identity))
     }
+    func openCleanup(category: String = "All candidates") {
+        page = "Cleanup"; cleanupCategory = category
+        if cleanupItems.isEmpty && !findingCleanup { findCleanup() }
+    }
+    func stageCandidates(_ candidates: [FileNode]) {
+        let bundles = runningBundles
+        var added = 0
+        for n in candidates {
+            guard policy.refusal(n.path, runningBundles: bundles) == nil,
+                  !queue.contains(where: { inside(n.path, $0.node.path) }), let identity = FileIdentity.read(n.path) else { continue }
+            queue.removeAll { inside($0.node.path, n.path) }
+            queue.append(QueueEntry(node: n, identity: identity)); added += 1
+        }
+        cleanupNote = "Added \(added) items to review. Nothing has moved; inspect the queue before confirming Trash."
+    }
+    func openTrash() { NSWorkspace.shared.open(URL(fileURLWithPath: sweepHome + "/.Trash", isDirectory: true)) }
     func findCleanup() {
         guard !findingCleanup else { return }
         findingCleanup = true; cleanupItems = []; cleanupNote = "Checking app caches and Downloads…"
         let cacheRoot = sweepHome + "/Library/Caches"
         let downloads = sweepHome + "/Downloads"
-        let roots = [cacheRoot, downloads, sweepHome + "/.npm/_cacache", sweepHome + "/.npm/_npx"] +
+        let trashPath = sweepHome + "/.Trash"
+        let roots = [trashPath, cacheRoot, downloads, sweepHome + "/.npm/_cacache", sweepHome + "/.npm/_npx"] +
             ["Claude", "Codex", "ChatGPT"].flatMap { a in ["Cache", "Code Cache", "GPUCache"].map { sweepHome + "/Library/Application Support/" + a + "/" + $0 } }
         let handle = ScanHandle(); cleanupHandle = handle
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            var found: [FileNode] = []; var skippedCount = 0; var cancelled = false
+            var found: [FileNode] = []; var skippedCount = 0; var cancelled = false; var trashTotal: Int64?
             if let handle {
                 for path in roots where FileManager.default.fileExists(atPath: path) {
-                    let collector = ScanCollector(rootPath: path) { _, _, _, _, _ in }
+                    let collector = ScanCollector(rootPath: path) { _ in }
                     let code = ms_scan_run(handle.pointer, path, 1, scanCallback, Unmanaged.passUnretained(collector).toOpaque())
                     skippedCount += collector.skipped
                     if code == ECANCELED { cancelled = true; break }
+                    if path == trashPath {
+                        if code == 0 && collector.skipped == 0 { trashTotal = collector.nodes.first(where: { $0.path == trashPath })?.bytes }
+                        continue
+                    }
                     let candidates = collector.nodes.filter { n in
                         n.bytes > 1024 * 1024 && ((path == cacheRoot || path == downloads) ? n.parent == path : n.path == path)
                     }.map { n -> FileNode in var item = n; item.category = path == downloads ? "Review download" : "App cache"; return item }
@@ -315,6 +483,7 @@ struct CleanupPolicy {
             }
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }; self.cleanupHandle = nil
+                if let bytes = trashTotal { self.trashBytes = bytes }
                 self.cleanupItems = found.sorted { $0.bytes > $1.bytes }; self.findingCleanup = false
                 self.cleanupNote = (cancelled ? "Stopped · partial results. " : "") + "\(found.count) items to review · \(skippedCount) inaccessible locations · Nothing is selected automatically."
             }
@@ -343,7 +512,14 @@ struct CleanupPolicy {
         freedThisSession += bytes; disk = DiskStatus.read(); showReview = false; trashBusy = false
         let note = "Moved \(succeeded.count) items (\(byteText(bytes))) to Trash. Space is reclaimed after you empty Trash in Finder."
         alert = note + (failures.isEmpty ? "" : "\n\nCould not move:\n" + failures.joined(separator: "\n"))
-        if !succeeded.isEmpty { scanComplete = false }
+        if !succeeded.isEmpty {
+            scanHandle?.cancel(); scanHandle = nil; scanID = UUID(); isScanning = false
+            overviewDate = overviewDate ?? sessionOverview?.date
+            overviewSource = "Before cleanup"; isSavedOverview = true
+            indexNotice = "Disk contents changed. Refresh to update displayed sizes."
+            scanComplete = false; scanIndex = nil; sessionOverview = nil; growthComparison = nil; latestSnapshot = nil
+            try? overviewStore.removeAll()
+        }
     }
     func openPermissions() { NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")!) }
 }
