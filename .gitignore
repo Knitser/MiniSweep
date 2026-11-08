@@ -1,0 +1,28 @@
+# Local builds and release archives
+/build/
+/dist/
+/release/
+*.app/
+*.dmg
+*.zip
+*.dSYM/
+*.o
+*.swiftdoc
+*.swiftmodule
+*.swiftsourceinfo
+
+# Local settings, credentials and diagnostics
+.DS_Store
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.p8
+*.mobileprovision
+*.log
+*snapshot*.json
+*scan*.json
+.idea/
+.vscode/
+xcuserdata/
