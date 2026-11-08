@@ -15,6 +15,8 @@ Built by [knitser](https://github.com/Knitser).
 - **Native appearance:** dark mode by default, native Liquid Glass on macOS 26 or later, material effects on earlier versions, and Aurora, Ocean and Copper map palettes. Light and system appearance remain available.
 - **Live memory monitor:** app footprints grouped with helper processes, five-second samples, trend charts, compressed memory and swap usage. Open an inspector for each process's PID, executable path, footprint, resident size, observed peak and sample window.
 - **Growth watch:** flags sustained memory growth after enough samples have been collected.
+- **Storage Growth Lens:** save a local size baseline, then see which immediate child paths grew, shrank, appeared or disappeared in later complete scans.
+- **Memory → storage links:** jump from an app’s memory inspector to its app bundle or a recognized VM’s on-disk workspace. Protected workload data stays outside cleanup.
 - **Reviewed cleanup:** find caches and old downloads, inspect them in Finder, and choose individual items for a final review.
 - **Trash first:** cleanup uses the native macOS Trash API. Protected folders, running app bundles and changed file identities are checked before each move.
 - **Local operation:** no account, API key, analytics, network service, login agent or scheduled cleanup.
@@ -42,6 +44,20 @@ Memory is sampled every five seconds using macOS physical-footprint counters, in
 The Change column and trend charts cover up to 15 minutes in the current session. Growth watch requires at least 30 seconds, 128 MiB and 20% growth, with at least four increases across the last six intervals. A change in an app's helper-process set resets its baseline.
 
 Sustained growth is a signal to investigate, not proof of a memory leak. Use Activity Monitor or Instruments for deeper diagnosis. **Quit** requests a normal app quit after confirmation; save your work first. Swap can remain allocated after apps close.
+
+## Storage Growth Lens
+
+A complete readable scan creates a local baseline for the selected folder. Later complete scans compare immediate child paths and their recursive allocated sizes against that baseline. The panel separates added, removed, grown and shrunken items and links existing paths to their metadata inspector.
+
+Use **Set baseline** to replace the comparison point, or the clear button to forget it. Inaccessible or incomplete scans do not overwrite a baseline or produce misleading removal reports. A folder or volume whose identity changed requires a new baseline.
+
+At most 10 folders are remembered, with up to 10,000 direct children per folder. Baselines contain paths, sizes, counts and filesystem identity; no file contents. They remain on this Mac in the app’s Application Support folder, use owner-only file permissions, and are never uploaded. Memory history and cleanup selections remain session-only. Growth does not imply that a file is junk or safe to delete, and shared APFS blocks remain an estimate.
+
+## Memory → storage
+
+Open an app’s memory inspector and choose **Map app storage** to investigate its disk footprint. For recognizable virtual machines, the inspector can also link to the VM workspace identified from open backing files. Attribution depends on what macOS permits the app to inspect and currently recognizes supported Claude and Docker layouts. A VM must be running to expose this context.
+
+VM images and session state are workload data. These links are for storage inspection, and protected Library paths cannot enter the cleanup queue.
 
 ## Cleanup
 
@@ -81,7 +97,7 @@ dist/MiniSweep.app/Contents/MacOS/MiniSweep --self-test
 dist/MiniSweep.app/Contents/MacOS/MiniSweep --trash-self-test
 ```
 
-The first command runs 36 checks covering size aggregation, sparse files, symlinks, cancellation, cleanup boundaries, file replacement and in-place edits, bounded file-type aggregation, growth thresholds and extreme treemap layouts. The second creates a disposable file, moves it to Trash, restores it intact and removes only its own fixture.
+The first command runs 50 checks covering size aggregation, sparse files, symlinks, cancellation, cleanup boundaries, file replacement and in-place edits, bounded file-type aggregation, growth thresholds, extreme treemap layouts, persisted size comparisons, partial-scan safeguards and VM backing-file classification. The second creates a disposable file, moves it to Trash, restores it intact and removes only its own fixture.
 
 Read-only diagnostics are also available:
 

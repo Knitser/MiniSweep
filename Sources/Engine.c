@@ -78,7 +78,26 @@ int ms_scan_run(MSScan *scan, const char *root, int max_depth, MSScanCallback cb
     fts_close(tree); free(paths[0]); return result;
 }
 
-static void find_vm_owner(int pid, char *out, size_t capacity) {
+void ms_vm_path_context(const char *path, char *out, size_t capacity, char *storage, size_t storage_capacity) {
+    if (!path || !out || !storage || !capacity || !storage_capacity) return;
+    if (strstr(path, "/Application Support/Claude/")) {
+        strlcpy(out, "Claude", capacity);
+        const char *bundle = strstr(path, ".bundle/");
+        if (strstr(path, "/vm_bundles/") && bundle) {
+            size_t length = (size_t)(bundle - path) + strlen(".bundle");
+            if (length < storage_capacity) { memcpy(storage, path, length); storage[length] = 0; }
+        }
+    } else if (strstr(path, "/com.docker.") || strstr(path, "/group.com.docker/") || strstr(path, "/.docker/")) {
+        strlcpy(out, "Docker", capacity);
+        const char *extension = strrchr(path, '.');
+        if (extension && (!strcmp(extension, ".raw") || !strcmp(extension, ".qcow2") || !strcmp(extension, ".img"))) {
+            strlcpy(storage, path, storage_capacity);
+            char *slash = strrchr(storage, '/'); if (slash) *slash = 0;
+        }
+    }
+}
+
+static void find_vm_owner(int pid, char *out, size_t capacity, char *storage, size_t storage_capacity) {
     int bytes = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, NULL, 0);
     if (bytes <= 0 || bytes > 4 * 1024 * 1024) return;
     struct proc_fdinfo *fds = malloc(bytes);
@@ -90,10 +109,8 @@ static void find_vm_owner(int pid, char *out, size_t capacity) {
         if (fds[i].proc_fdtype != PROX_FDTYPE_VNODE) continue;
         struct vnode_fdinfowithpath path = {0};
         if (proc_pidfdinfo(pid, fds[i].proc_fd, PROC_PIDFDVNODEPATHINFO, &path, sizeof(path)) <= 0) continue;
-        if (strstr(path.pvip.vip_path, "/Application Support/Claude/")) { strlcpy(out, "Claude", capacity); break; }
-        if (strstr(path.pvip.vip_path, "/com.docker.") || strstr(path.pvip.vip_path, "/.docker/")) {
-            strlcpy(out, "Docker", capacity); break;
-        }
+        ms_vm_path_context(path.pvip.vip_path, out, capacity, storage, storage_capacity);
+        if (storage[0]) break;
     }
     free(fds);
 }
@@ -121,7 +138,7 @@ int ms_processes(MSProcess **output) {
         if (proc_pidinfo(pids[i], PROC_PIDTBSDINFO, 0, &bsd, sizeof(bsd)) > 0) r->parent = bsd.pbi_ppid;
         proc_name(pids[i], r->name, sizeof(r->name));
         proc_pidpath(pids[i], r->executable, sizeof(r->executable));
-        if (strstr(r->executable, "com.apple.Virtualization.VirtualMachine")) find_vm_owner(pids[i], r->owner, sizeof(r->owner));
+        if (strstr(r->executable, "com.apple.Virtualization.VirtualMachine")) find_vm_owner(pids[i], r->owner, sizeof(r->owner), r->storage, sizeof(r->storage));
     }
     free(pids); *output = rows; return used;
 }

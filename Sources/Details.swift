@@ -197,10 +197,13 @@ struct FileInspector: View {
 
 struct MemoryInspector: View {
     @ObservedObject var monitor: MemoryMonitor
+    @ObservedObject var storageModel: SweepModel
     let initial: MemoryRow
     @Environment(\.dismiss) private var dismiss
     private var row: MemoryRow { monitor.rows.first { $0.id == initial.id } ?? initial }
     private var available: Bool { monitor.rows.contains { $0.id == initial.id } }
+    private var storagePaths: [String] { Array(Set(row.details.map(\.storage).filter { !$0.isEmpty })).sorted() }
+    private func mapStorage(_ path: String) { dismiss(); storageModel.page = "Storage"; storageModel.scan(path) }
     var body: some View {
         ScrollView {
         VStack(alignment: .leading, spacing: 18) {
@@ -228,6 +231,20 @@ struct MemoryInspector: View {
                     Text(row.growing ? "Sustained growth detected. Inspect the largest helpers below; a growth signal does not establish a leak." : "Growth watch needs 30 seconds, 128 MiB and 20% growth, with repeated rising samples. Process changes reset the baseline.").font(.system(size: 10)).foregroundStyle(Palette.secondary)
                 }
             }
+            if !storagePaths.isEmpty {
+                Panel(padding: 16) {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Label("Virtual machine → disk workspace", systemImage: "externaldrive.connected.to.line.below").font(.system(size: 13, weight: .semibold))
+                        ForEach(storagePaths, id: \.self) { path in
+                            HStack {
+                                Text(shortPath(path)).font(.system(size: 10, design: .monospaced)).foregroundStyle(Palette.secondary).lineLimit(2).truncationMode(.middle)
+                                Spacer(); Button("Map storage") { mapStorage(path) }.buttonStyle(QuietButton())
+                            }
+                        }
+                        Text("Attributed from the VM’s open files. This is workload data, not a cache cleanup suggestion. Storage Explorer keeps protected Library data out of cleanup.").font(.system(size: 10)).foregroundStyle(Palette.secondary)
+                    }
+                }
+            }
             HStack { Text("Inside this app").font(.system(size: 15, weight: .semibold)); Spacer(); Text("FOOTPRINT / RESIDENT").font(.system(size: 9, weight: .semibold)).tracking(1).foregroundStyle(Palette.secondary) }
             ScrollView {
                 LazyVStack(spacing: 0) {
@@ -250,6 +267,7 @@ struct MemoryInspector: View {
             Text("Footprint includes compressed memory charged to the process. Resident size counts pages currently in RAM and can count shared pages in several processes. These measures are not additive. Protected helpers may be unavailable.").font(.system(size: 10)).foregroundStyle(Palette.secondary).fixedSize(horizontal: false, vertical: true)
             HStack {
                 Button("Reset all baselines") { monitor.reset() }.buttonStyle(QuietButton())
+                if row.path.hasSuffix(".app") { Button("Map app storage") { mapStorage(row.path) }.buttonStyle(QuietButton()) }
                 Spacer()
                 if row.path.hasSuffix(".app"), available { Button("Quit app…") { monitor.quit(row) }.buttonStyle(QuietButton()) }
                 Button("Done") { dismiss() }.buttonStyle(PrimaryButton())

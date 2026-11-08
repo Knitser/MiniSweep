@@ -20,7 +20,7 @@ func runMemoryCLI() -> Int32 {
     var ptr: UnsafeMutablePointer<MSProcess>?
     let n = Int(ms_processes(&ptr)); let stats = ms_memory(); var rows: [[String: Any]] = []
     if let ptr {
-        for i in 0..<n { let p = ptr[i]; rows.append(["pid": p.pid, "parent": p.parent, "name": cString(p.name), "bytes": p.footprint, "owner": cString(p.owner), "executable": cString(p.executable)]) }
+        for i in 0..<n { let p = ptr[i]; rows.append(["pid": p.pid, "parent": p.parent, "name": cString(p.name), "bytes": p.footprint, "owner": cString(p.owner), "executable": cString(p.executable), "storage": cString(p.storage)]) }
         ms_processes_free(ptr)
     }
     let report: [String: Any] = ["physical": stats.physical, "compressed": stats.compressed, "swap": stats.swap_used, "processes": rows.sorted { ($0["bytes"] as? UInt64 ?? 0) > ($1["bytes"] as? UInt64 ?? 0) }]
@@ -51,7 +51,7 @@ func runTrashSelfTest() -> Int32 {
     }
 }
 
-func runSelfTests() -> Int32 {
+@MainActor func runSelfTests() -> Int32 {
     var failures: [String] = []; var checks = 0
     func check(_ condition: @autoclosure () -> Bool, _ name: String) { checks += 1; if !condition() { failures.append(name) } }
     let fm = FileManager.default
@@ -132,6 +132,47 @@ func runSelfTests() -> Int32 {
         let uneven = (0..<300).map { FileNode(path: "/fixture/\($0)", bytes: $0 == 0 ? 1_000_000_000 : 1, logical: 0, files: 1, directory: true) }
         let compact = mapLayout(uneven, size: CGSize(width: 320, height: 200))
         check(compact.count == 65 && compact.allSatisfy { $0.rect.width >= 0 && $0.rect.height >= 0 && $0.rect.maxX <= 320 && $0.rect.maxY <= 200 }, "tiny treemap blocks remain in bounds and preserve the all-items group")
+        let diskBaseline = StorageBaseline(root: downloads.path, date: now.addingTimeInterval(-3600), bytes: 100, device: 1, inode: 2, entries: [
+            StorageEntry(path: downloads.path + "/growing", bytes: 60, files: 2, directory: true),
+            StorageEntry(path: downloads.path + "/removed", bytes: 40, files: 1, directory: false)])
+        let current = StorageBaseline(root: downloads.path, date: now, bytes: 120, device: 1, inode: 2, entries: [
+            StorageEntry(path: downloads.path + "/growing", bytes: 80, files: 3, directory: true),
+            StorageEntry(path: downloads.path + "/new", bytes: 40, files: 1, directory: false)])
+        let comparison = StorageComparison(baseline: diskBaseline, current: current)
+        check(comparison.delta == 20 && comparison.changes.count == 3, "growth lens reconciles added, removed and resized paths")
+        check(comparison.changes.first(where: { $0.name == "removed" })?.kind == "Removed", "removed paths stay distinct from files that shrank")
+        check(comparison.changes.first(where: { $0.name == "new" })?.kind == "Added", "new paths are identified")
+        let zero = StorageBaseline(root: downloads.path, date: now, bytes: 100, device: 1, inode: 2, entries: diskBaseline.entries + [StorageEntry(path: downloads.path + "/empty", bytes: 0, files: 0, directory: false)])
+        check(StorageComparison(baseline: diskBaseline, current: zero).changes.first?.kind == "Added", "zero-byte additions remain visible")
+        let baselineFile = temp.appendingPathComponent("private-baselines.json")
+        let store = GrowthLensStore(file: baselineFile)
+        try store.save(diskBaseline)
+        let loaded = GrowthLensStore(file: baselineFile)
+        check(loaded.baseline(for: downloads.path)?.date == diskBaseline.date, "growth baselines persist between sessions")
+        let storedAttributes = try fm.attributesOfItem(atPath: baselineFile.path)
+        check((storedAttributes[.posixPermissions] as? NSNumber)?.intValue == 0o600, "baseline files use owner-only permissions")
+        let lensModel = SweepModel(growthStore: loaded)
+        lensModel.root = downloads.path; lensModel.nodes = scan.nodes; lensModel.scanComplete = true; lensModel.skipped = 1
+        lensModel.updateGrowthLens()
+        check(lensModel.growthComparison == nil && loaded.baseline(for: downloads.path)?.date == diskBaseline.date, "inaccessible folders cannot create false removal comparisons or overwrite baselines")
+        try loaded.remove(downloads.path)
+        check(GrowthLensStore(file: baselineFile).baseline(for: downloads.path) == nil, "saved baselines can be cleared")
+        try Data("corrupt baseline".utf8).write(to: baselineFile)
+        check(GrowthLensStore(file: baselineFile).loadError != nil, "corrupt baseline data is reported rather than silently trusted")
+        check(StorageBaseline.capture(root: downloads.path, nodes: scan.nodes) != nil, "complete folder snapshots retain filesystem identity")
+        func vmContext(_ path: String) -> (String, String) {
+            var owner = [CChar](repeating: 0, count: 64), storage = [CChar](repeating: 0, count: 4096)
+            path.withCString { p in owner.withUnsafeMutableBufferPointer { o in storage.withUnsafeMutableBufferPointer { d in
+                ms_vm_path_context(p, o.baseAddress, o.count, d.baseAddress, d.count)
+            } } }
+            return (String(cString: owner), String(cString: storage))
+        }
+        let vmBundle = "/fixture/Library/Application Support/Claude/vm_bundles/example.bundle"
+        check(vmContext(vmBundle + "/rootfs.img").1 == vmBundle, "VM disk attribution maps a bundle rather than an individual backing file")
+        check(vmContext("/fixture/Library/Application Support/Claude/claude-code/runtime").1.isEmpty, "ordinary helper executables are not misidentified as VM storage")
+        let dockerDisk = "/fixture/Library/Containers/com.docker.docker/Data/vms/0/data"
+        check(vmContext(dockerDisk + "/Docker.raw").1 == dockerDisk, "Docker disk attribution identifies the VM data directory")
+        check(vmContext(dockerDisk + "/Docker.raw.log").1.isEmpty, "logs named after a disk image are not classified as backing disks")
     } catch { failures.append(error.localizedDescription) }
     print("MiniSweep: \(checks - failures.count)/\(checks) checks passed")
     for failure in failures { print("FAIL: " + failure) }

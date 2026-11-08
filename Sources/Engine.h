@@ -17,9 +17,11 @@ typedef struct {
     char name[256];
     char executable[4096];
     char owner[64];
+    char storage[4096];
 } MSProcess;
 int ms_processes(MSProcess **output);
 void ms_processes_free(MSProcess *output);
+void ms_vm_path_context(const char *path, char *owner, size_t owner_capacity, char *storage, size_t storage_capacity);
 typedef struct {
     uint64_t physical, compressed, swap_used, swap_total;
     int memory_valid, swap_valid;

@@ -114,7 +114,7 @@ struct MainView: View {
         .sheet(isPresented: $model.showAccess) { AccessView(model: model) }
         .sheet(isPresented: $model.showContents) { FolderContentsView(model: model) }
         .sheet(item: $model.inspected) { node in FileInspector(model: model, node: node) }
-        .sheet(item: $memory.selected) { row in MemoryInspector(monitor: memory, initial: row) }
+        .sheet(item: $memory.selected) { row in MemoryInspector(monitor: memory, storageModel: model, initial: row) }
         .alert("MiniSweep", isPresented: Binding(get: { model.alert != nil }, set: { if !$0 { model.alert = nil } })) {
             Button("OK", role: .cancel) { model.alert = nil }
         } message: { Text(model.alert ?? "") }
@@ -271,6 +271,7 @@ struct StorageView: View {
             HStack { Image(systemName: "lock.shield").foregroundStyle(.orange); Text("\(model.skipped) locations couldn’t be read. Totals are partial.").font(.system(size: 11)); Spacer(); Button("See details") { model.showAccess = true }.buttonStyle(.plain).foregroundStyle(Palette.green).font(.system(size: 11, weight: .medium)) }
         }
         if !model.fileTypes.isEmpty { FileTypesPanel(totals: model.fileTypes) }
+        GrowthLensPanel(model: model)
         if !model.largest.isEmpty {
             Panel {
                 VStack(alignment: .leading, spacing: 14) {

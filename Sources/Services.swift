@@ -172,6 +172,11 @@ struct CleanupPolicy {
     @Published var navigation: [String] = []
     @Published var navigationIndex = -1
     @Published var largestFilter = ""
+    @Published var growthComparison: StorageComparison?
+    @Published var growthNotice = ""
+    var latestSnapshot: StorageBaseline?
+    let growthStore: GrowthLensStore
+    init(growthStore: GrowthLensStore? = nil) { self.growthStore = growthStore ?? GrowthLensStore() }
     @Published var queue: [QueueEntry] = []
     @Published var showReview = false
     @Published var showAccess = false
@@ -219,6 +224,7 @@ struct CleanupPolicy {
             navigationIndex = navigation.count - 1
         }
         root = newRoot; scanID = UUID(); let id = scanID
+        growthComparison = nil; latestSnapshot = nil; growthNotice = "Comparing after this scan finishes…"
         nodes = []; largest = []; selected = nil; fileTypes = []; largestFilter = ""; scanErrors = []; skipped = 0; scannedFiles = 0; scanBytes = 0
         storageFilter = ""; isScanning = true; scanComplete = false; start = Date(); elapsed = 0
         guard let handle = ScanHandle() else { isScanning = false; alert = "Could not start the scanner."; return }
@@ -241,11 +247,36 @@ struct CleanupPolicy {
                 self.skipped = collector.skipped; self.scanErrors = collector.errors
                 self.elapsed = Date().timeIntervalSince(self.start); self.disk = DiskStatus.read()
                 self.scanComplete = code == 0
+                self.updateGrowthLens()
                 if code != 0 && code != ECANCELED { self.alert = "Scan stopped: \(String(cString: strerror(code)))." }
             }
         }
     }
     func stopScan() { scanHandle?.cancel() }
+    func updateGrowthLens() {
+        guard scanComplete, skipped == 0 else {
+            growthNotice = "Comparison paused: incomplete or inaccessible folders could look like removed files. Finish a complete readable scan first."
+            return
+        }
+        guard let current = StorageBaseline.capture(root: root, nodes: nodes) else { growthNotice = "Choose a folder with at most 10,000 immediate children to save a baseline."; return }
+        latestSnapshot = current
+        if let error = growthStore.loadError { growthNotice = error; return }
+        if let baseline = growthStore.baseline(for: root) {
+            guard baseline.device == current.device, baseline.inode == current.inode else { growthNotice = "This path now identifies a different folder or volume. Set a fresh baseline to compare it."; return }
+            growthComparison = StorageComparison(baseline: baseline, current: current); growthNotice = ""
+        } else { setGrowthBaseline() }
+    }
+    func setGrowthBaseline() {
+        guard let current = latestSnapshot, current.root == root, scanComplete, skipped == 0 else { return }
+        do {
+            try growthStore.save(current); growthComparison = StorageComparison(baseline: current, current: current)
+            growthNotice = "Baseline saved on this Mac. Future complete scans compare against it until you replace or clear it."
+        } catch { alert = "Could not save the baseline: \(error.localizedDescription)" }
+    }
+    func clearGrowthBaseline() {
+        do { try growthStore.remove(root); growthComparison = nil; growthNotice = "Saved baseline cleared. Set a baseline or rescan to begin again." }
+        catch { alert = "Could not clear the baseline: \(error.localizedDescription)" }
+    }
     func navigate(_ offset: Int) {
         let next = navigationIndex + offset
         guard navigation.indices.contains(next) else { return }
@@ -322,6 +353,7 @@ struct RawProcess {
     let bytes: UInt64, started: UInt64
     let resident: UInt64
     let name: String, executable: String, owner: String
+    let storage: String
 }
 struct ProcessDetail: Identifiable {
     let pid: Int32
@@ -330,6 +362,7 @@ struct ProcessDetail: Identifiable {
     let bytes: Int64
     let resident: Int64
     let started: UInt64
+    var storage: String = ""
     var id: Int32 { pid }
 }
 struct MemorySample { let time: Date; let bytes: Int64 }
@@ -386,7 +419,7 @@ struct MemoryRow: Identifiable {
             if let p = pointer {
                 for i in 0..<count {
                     let r = p[i]
-                    raw.append(RawProcess(pid: r.pid, parent: r.parent, bytes: r.footprint, started: r.started, resident: r.resident, name: cString(r.name), executable: cString(r.executable), owner: cString(r.owner)))
+                    raw.append(RawProcess(pid: r.pid, parent: r.parent, bytes: r.footprint, started: r.started, resident: r.resident, name: cString(r.name), executable: cString(r.executable), owner: cString(r.owner), storage: cString(r.storage)))
                 }
                 ms_processes_free(p)
             }
@@ -413,7 +446,7 @@ struct MemoryRow: Identifiable {
                     var samples = self.history[key] ?? []
                     // A changed set of helper processes starts a new baseline, avoiding false leak alerts.
                     let details = value.3.compactMap { lookup[$0] }.map {
-                        ProcessDetail(pid: $0.pid, name: $0.name, path: $0.executable, bytes: Int64($0.bytes), resident: Int64($0.resident), started: $0.started)
+                        ProcessDetail(pid: $0.pid, name: $0.name, path: $0.executable, bytes: Int64($0.bytes), resident: Int64($0.resident), started: $0.started, storage: $0.storage)
                     }.sorted { $0.bytes > $1.bytes }
                     if let old = self.rows.first(where: { $0.id == key }),
                        Set(old.details.map { "\($0.pid):\($0.started)" }) != Set(details.map { "\($0.pid):\($0.started)" }) { samples = [] }
