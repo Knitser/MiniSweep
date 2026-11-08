@@ -10,8 +10,10 @@ Built by [knitser](https://github.com/Knitser).
 
 ## Features
 
-- **Storage map:** a treemap and sorted list of the largest files and folders, with allocated sizes and a list of large files anywhere in the scan.
-- **Live memory monitor:** app footprints grouped with helper processes, five-second samples, trend charts, compressed memory and swap usage.
+- **Storage map:** single-click folder drill-down, Back/Forward navigation, a full folder-contents browser, configurable sorting, and large-file filtering. Every subfolder remains accessible, including items grouped into smaller blocks.
+- **File details:** allocated versus logical size, nested file counts, timestamps, ownership, permissions, path copying, and file-type totals from the full scan.
+- **Native appearance:** dark mode by default, native Liquid Glass on macOS 26 or later, material effects on earlier versions, and Aurora, Ocean and Copper map palettes. Light and system appearance remain available.
+- **Live memory monitor:** app footprints grouped with helper processes, five-second samples, trend charts, compressed memory and swap usage. Open an inspector for each process's PID, executable path, footprint, resident size, observed peak and sample window.
 - **Growth watch:** flags sustained memory growth after enough samples have been collected.
 - **Reviewed cleanup:** find caches and old downloads, inspect them in Finder, and choose individual items for a final review.
 - **Trash first:** cleanup uses the native macOS Trash API. Protected folders, running app bundles and changed file identities are checked before each move.
@@ -19,17 +21,17 @@ Built by [knitser](https://github.com/Knitser).
 
 ## Install
 
-1. Download `MiniSweep-1.0.0-macos-arm64.dmg` or the app ZIP from [Releases](https://github.com/Knitser/MiniSweep/releases/latest).
+1. Download the macOS DMG or the app ZIP from [Releases](https://github.com/Knitser/MiniSweep/releases/latest).
 2. Open the disk image or extract the ZIP, then drag `MiniSweep.app` into Applications.
 3. Open MiniSweep. The first scan maps Applications.
 
-The release is ad-hoc signed and is not Apple-notarized. macOS may require an explicit approval to open a downloaded build. You can also build the app locally using the instructions below.
+The current release is signed with Developer ID and notarized by Apple. Notarization tickets are attached for offline verification. macOS may still show its normal first-open confirmation for an app downloaded from the internet. You can also build the app locally using the instructions below.
 
 For a complete storage scan, use **Disk access & permissions** to open Full Disk Access in System Settings, add MiniSweep, then quit and reopen it. Folders macOS will not let the app read are skipped and reported, so totals may be partial.
 
 ## Storage explorer
 
-Choose Home, Applications, Downloads, Caches, All data, or a custom folder or mounted volume. Bigger blocks mean larger items. Click to select; double-click a folder to scan inside it. **Reveal** opens the selected item in Finder. **Add to review** queues a permitted item without moving it.
+Choose Home, Applications, Downloads, Caches, All data, or a custom folder or mounted volume. Bigger blocks mean larger items. Single-click a folder block to scan inside it. Back and Forward return through folder history. Use All items or click the Other items block to browse every item in the current folder. Click a file block to select it, then open Details for metadata. **Reveal** opens the selected item in Finder. **Add to review** queues a permitted item without moving it.
 
 Scanning runs in the background, reports progress and can be stopped. Directory symlinks are not followed, and scans stay on the starting filesystem. Sparse files are measured by allocated blocks rather than apparent length. APFS clones and hard links can share blocks, so per-path totals are estimates and may exceed the space a cleanup would reclaim.
 
@@ -49,7 +51,7 @@ Downloads can contain your only copy of a file. Apps may need to download data a
 
 Cleanup accepts personal files under your home directory, individual apps directly inside Applications, and recognized cache locations. It protects system locations, hidden personal folders, general Library data, running app bundles and MiniSweep itself. External volumes can be mapped but cannot be cleaned by this version.
 
-Parent/child selections are deduplicated, paths and file identities are revalidated, and failed moves are reported individually. Items go to Trash, where Finder can restore them. **Space is reclaimed only when you empty Trash yourself.**
+Parent/child selections are deduplicated, paths, file identities, modification times and sizes are revalidated, and failed moves are reported individually. Items go to Trash, where Finder can restore them. **Space is reclaimed only when you empty Trash yourself.**
 
 ## Build
 
@@ -66,12 +68,20 @@ The build targets Apple silicon and macOS 14. Pass an output directory to `build
 
 ## Verify
 
+Local builds use an ad-hoc signature unless a Developer ID identity is supplied. Release signing reads the private key from Keychain; it never exports it.
+
+```sh
+MINISWEEP_SIGNING_IDENTITY="Developer ID Application: Your Name (TEAMID)" zsh build.sh
+```
+
+Developer ID signing alone is not notarization. A distribution build must also be submitted to Apple and have its accepted ticket stapled before packaging. Credentials and signing keys must stay outside the repository.
+
 ```sh
 dist/MiniSweep.app/Contents/MacOS/MiniSweep --self-test
 dist/MiniSweep.app/Contents/MacOS/MiniSweep --trash-self-test
 ```
 
-The first command runs 28 checks covering size aggregation, sparse files, symlinks, cancellation, cleanup boundaries, file identity changes, growth thresholds and treemap bounds. The second creates a disposable file, moves it to Trash, restores it intact and removes only its own fixture.
+The first command runs 36 checks covering size aggregation, sparse files, symlinks, cancellation, cleanup boundaries, file replacement and in-place edits, bounded file-type aggregation, growth thresholds and extreme treemap layouts. The second creates a disposable file, moves it to Trash, restores it intact and removes only its own fixture.
 
 Read-only diagnostics are also available:
 

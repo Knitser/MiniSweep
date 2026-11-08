@@ -26,3 +26,14 @@
 .idea/
 .vscode/
 xcuserdata/
+
+# Signing material stays in Keychain or local private work folders
+/signing/
+*.cer
+*.der
+*.csr
+*.certSigningRequest
+*.pfx
+*.p7b
+*.p7c
+*.notary.json

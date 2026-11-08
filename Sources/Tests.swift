@@ -11,7 +11,8 @@ func scanSynchronously(_ root: String, cancelled: Bool = false) -> (ScanCollecto
 func runScanCLI(_ path: String) -> Int32 {
     let (collector, code) = scanSynchronously(path)
     let report: [String: Any] = ["path": path, "result": code, "skipped": collector.skipped,
-        "nodes": collector.nodes.map { ["path": $0.path, "allocated": $0.bytes, "logical": $0.logical, "files": $0.files, "directory": $0.directory] as [String: Any] }, "errors": collector.errors]
+        "nodes": collector.nodes.map { ["path": $0.path, "allocated": $0.bytes, "logical": $0.logical, "files": $0.files, "directory": $0.directory] as [String: Any] }, "errors": collector.errors,
+        "fileTypes": collector.fileTypes.values.sorted { $0.bytes > $1.bytes }.map { ["extension": $0.extensionName, "allocated": $0.bytes, "logical": $0.logical, "count": $0.count] as [String: Any] }]
     if let data = try? JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys]) { print(String(decoding: data, as: UTF8.self)) }
     return code == 0 ? 0 : 1
 }
@@ -79,6 +80,12 @@ func runSelfTests() -> Int32 {
         check(sparseNode?.logical == 100 * 1024 * 1024, "logical sparse-file size retained")
         check((sparseNode?.bytes ?? Int64.max) < 1024 * 1024, "sparse file not counted at logical size")
         check((root?.bytes ?? 0) >= 3 * 1024 * 1024 && (root?.bytes ?? Int64.max) < 5 * 1024 * 1024, "ancestor allocated totals exclude linked external files")
+        check(scan.fileTypes["bin"]?.count == 2, "file type totals include nested small and sparse files")
+        check(scan.fileTypes["bin"]?.logical == 103 * 1024 * 1024, "file type logical totals preserve sparse-file lengths")
+        check(scan.fileTypes.values.reduce(UInt64(0)) { $0 + $1.count } == 2, "file type totals exclude symbolic links and their targets")
+        let manyTypes = ScanCollector { _, _, _, _, _ in }
+        for i in 0..<1000 { manyTypes.event(path: "type\(i)", kind: 5, allocated: 10, logical: 10, files: 1, error: 0) }
+        check(manyTypes.fileTypes.count <= 513 && manyTypes.fileTypes.values.reduce(UInt64(0)) { $0 + $1.count } == 1000, "rare file types are bounded without losing total counts")
         let (_, cancelled) = scanSynchronously(downloads.path, cancelled: true)
         check(cancelled == ECANCELED, "cancellation stops before traversal")
         let (_, missing) = scanSynchronously(temp.appendingPathComponent("missing").path)
@@ -106,16 +113,25 @@ func runSelfTests() -> Int32 {
         try fm.moveItem(at: sparse, to: downloads.appendingPathComponent("old.bin"))
         try Data("replacement".utf8).write(to: sparse)
         check(FileIdentity.read(sparse.path) != identity, "replaced files detected before trashing")
+        let editedIdentity = FileIdentity.read(sparse.path)
+        let editor = try FileHandle(forWritingTo: sparse)
+        try editor.truncate(atOffset: 0); try editor.write(contentsOf: Data("changed after review with the same inode".utf8)); try editor.close()
+        check(FileIdentity.read(sparse.path)?.inode == editedIdentity?.inode, "in-place edit keeps the test inode")
+        check(FileIdentity.read(sparse.path) != editedIdentity, "in-place edits invalidate a cleanup review")
         let now = Date(); let baseline: Int64 = 500 * 1024 * 1024
         let rising = (0..<8).map { MemorySample(time: now.addingTimeInterval(Double($0 * 5)), bytes: baseline + Int64($0) * 32 * 1024 * 1024) }
         let growth = MemoryRow(id: "test", name: "Test", path: "", bytes: rising.last!.bytes, processes: [1], samples: rising)
         check(growth.growing, "sustained memory growth flagged")
+        check(growth.peak == rising.last!.bytes && growth.observationSeconds == 35, "memory inspector peak and observation duration match samples")
         let warmup = MemoryRow(id: "test", name: "Test", path: "", bytes: rising[2].bytes, processes: [1], samples: Array(rising.prefix(3)))
         check(!warmup.growing, "short memory spikes do not trigger growth watch")
         let flat = (0..<8).map { MemorySample(time: now.addingTimeInterval(Double($0 * 5)), bytes: baseline) }
         check(!MemoryRow(id: "test", name: "Test", path: "", bytes: baseline, processes: [1], samples: flat).growing, "stable memory is not flagged")
         let tiles = mapLayout(scan.nodes.filter { $0.parent == downloads.path }, size: CGSize(width: 640, height: 320))
         check(!tiles.isEmpty && tiles.allSatisfy { $0.rect.width >= 0 && $0.rect.height >= 0 && $0.rect.maxX <= 640 && $0.rect.maxY <= 320 }, "treemap stays in bounds")
+        let uneven = (0..<300).map { FileNode(path: "/fixture/\($0)", bytes: $0 == 0 ? 1_000_000_000 : 1, logical: 0, files: 1, directory: true) }
+        let compact = mapLayout(uneven, size: CGSize(width: 320, height: 200))
+        check(compact.count == 65 && compact.allSatisfy { $0.rect.width >= 0 && $0.rect.height >= 0 && $0.rect.maxX <= 320 && $0.rect.maxY <= 200 }, "tiny treemap blocks remain in bounds and preserve the all-items group")
     } catch { failures.append(error.localizedDescription) }
     print("MiniSweep: \(checks - failures.count)/\(checks) checks passed")
     for failure in failures { print("FAIL: " + failure) }

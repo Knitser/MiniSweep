@@ -61,6 +61,12 @@ int ms_scan_run(MSScan *scan, const char *root, int max_depth, MSScanCallback cb
             MSTotals *parent = e->fts_parent->fts_pointer;
             if (parent) { parent->allocated += allocated; parent->logical += logical; parent->files++; }
             files++; seen += allocated;
+            if (S_ISREG(e->fts_statp->st_mode)) {
+                const char *extension = strrchr(e->fts_name, '.');
+                if (!extension || extension == e->fts_name || strlen(extension) > 33) extension = "";
+                else extension++;
+                cb(ctx, extension, 5, allocated, logical, 1, 0);
+            }
             if (e->fts_level <= max_depth || allocated >= 8 * 1024 * 1024)
                 cb(ctx, e->fts_path, 2, allocated, logical, 1, S_ISLNK(e->fts_statp->st_mode) ? 1 : 0);
         }

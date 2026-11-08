@@ -29,6 +29,18 @@ struct FileNode: Identifiable, Hashable {
     var parent: String { URL(fileURLWithPath: path).deletingLastPathComponent().path }
 }
 
+struct FileTypeTotal: Identifiable {
+    let extensionName: String
+    var bytes: Int64 = 0
+    var logical: Int64 = 0
+    var count: UInt64 = 0
+    var id: String { extensionName }
+    var label: String { extensionName == "#other" ? "Other file types" : extensionName.isEmpty ? "No extension" : "." + extensionName }
+}
+enum StorageSort: String, CaseIterable {
+    case largest = "Largest first", smallest = "Smallest first", name = "Name", files = "Most files"
+}
+
 struct DiskStatus {
     var total: Int64 = 0
     var free: Int64 = 0
@@ -46,13 +58,23 @@ final class ScanCollector: @unchecked Sendable {
     var largest: [FileNode] = []
     var errors: [String] = []
     var skipped = 0
+    var fileTypes: [String: FileTypeTotal] = [:]
+    let rootPath: String?
     let progress: ([FileNode], Int64, UInt64, String, Int) -> Void
-    init(progress: @escaping ([FileNode], Int64, UInt64, String, Int) -> Void) { self.progress = progress }
+    init(rootPath: String? = nil, progress: @escaping ([FileNode], Int64, UInt64, String, Int) -> Void) { self.rootPath = rootPath; self.progress = progress }
     func event(path: String, kind: Int32, allocated: Int64, logical: Int64, files: UInt64, error: Int32) {
+        if kind == 5 {
+            var ext = path.lowercased()
+            if fileTypes[ext] == nil && fileTypes.count >= 512 { ext = "#other" }
+            var value = fileTypes[ext] ?? FileTypeTotal(extensionName: ext)
+            value.bytes += allocated; value.logical += logical; value.count += files
+            fileTypes[ext] = value
+            return
+        }
         if kind == 1 || kind == 2 {
             let n = FileNode(path: path, bytes: allocated, logical: logical, files: files, directory: kind == 1)
-            // Keep a bounded directory map; large files have a separate bounded list.
-            if kind == 1 || nodes.count < 24_000 { nodes.append(n) }
+            // Keep every direct child, even when large nested files are discovered first.
+            if kind == 1 || rootPath == nil || n.parent == rootPath { nodes.append(n) }
             if kind == 2 && allocated >= 8 * 1024 * 1024 {
                 largest.append(n)
                 if largest.count > 250 { largest.sort { $0.bytes > $1.bytes }; largest = Array(largest.prefix(150)) }
@@ -82,10 +104,15 @@ let scanCallback: MSScanCallback = { context, path, kind, allocated, logical, fi
 struct FileIdentity: Equatable {
     let device: Int32
     let inode: UInt64
+    let length: Int64
+    let modifiedSeconds: Int64
+    let modifiedNanoseconds: Int64
+    let mode: UInt16
     static func read(_ path: String) -> FileIdentity? {
         var s = stat()
         guard lstat(path, &s) == 0 else { return nil }
-        return FileIdentity(device: s.st_dev, inode: s.st_ino)
+        return FileIdentity(device: s.st_dev, inode: s.st_ino, length: s.st_size,
+                            modifiedSeconds: Int64(s.st_mtimespec.tv_sec), modifiedNanoseconds: Int64(s.st_mtimespec.tv_nsec), mode: s.st_mode)
     }
 }
 struct QueueEntry: Identifiable {
@@ -137,6 +164,14 @@ struct CleanupPolicy {
     @Published var scanErrors: [String] = []
     @Published var elapsed: TimeInterval = 0
     @Published var selected: FileNode?
+    @Published var showContents = false
+    @Published var inspected: FileNode?
+    @Published var fileTypes: [FileTypeTotal] = []
+    @Published var storageSort = StorageSort.largest
+    @Published var storageKind = "All items"
+    @Published var navigation: [String] = []
+    @Published var navigationIndex = -1
+    @Published var largestFilter = ""
     @Published var queue: [QueueEntry] = []
     @Published var showReview = false
     @Published var showAccess = false
@@ -154,8 +189,18 @@ struct CleanupPolicy {
     var start = Date()
     var cleanupHandle: ScanHandle?
     var childNodes: [FileNode] {
-        nodes.filter { $0.parent == root && (storageFilter.isEmpty || $0.name.localizedCaseInsensitiveContains(storageFilter)) }.sorted { $0.bytes > $1.bytes }
+        let items = nodes.filter { $0.parent == root && (storageFilter.isEmpty || $0.name.localizedCaseInsensitiveContains(storageFilter)) &&
+            (storageKind == "All items" || (storageKind == "Folders" ? $0.directory : !$0.directory)) }
+        return items.sorted {
+            switch storageSort {
+            case .largest: return $0.bytes == $1.bytes ? $0.path < $1.path : $0.bytes > $1.bytes
+            case .smallest: return $0.bytes == $1.bytes ? $0.path < $1.path : $0.bytes < $1.bytes
+            case .name: return $0.name.localizedStandardCompare($1.name) == .orderedAscending
+            case .files: return $0.files == $1.files ? $0.bytes > $1.bytes : $0.files > $1.files
+            }
+        }
     }
+    var filteredLargest: [FileNode] { largest.filter { largestFilter.isEmpty || $0.path.localizedCaseInsensitiveContains(largestFilter) } }
     var folderBytes: Int64 { nodes.first(where: { $0.path == root })?.bytes ?? scanBytes }
     var queueBytes: Int64 { queue.reduce(0) { $0 + $1.node.bytes } }
     var runningBundles: [String] { NSWorkspace.shared.runningApplications.compactMap { $0.bundleURL?.path } }
@@ -164,16 +209,21 @@ struct CleanupPolicy {
         p.message = "Choose a folder or volume to map. MiniSweep reads sizes without opening file contents."
         if p.runModal() == .OK, let url = p.url { scan(url.path) }
     }
-    func scan(_ path: String? = nil) {
+    func scan(_ path: String? = nil, recordHistory: Bool = true) {
         scanHandle?.cancel()
         let newRoot = URL(fileURLWithPath: path ?? root).standardizedFileURL.path
         guard FileManager.default.fileExists(atPath: newRoot) else { alert = "This folder is no longer available."; return }
+        if recordHistory && (navigationIndex < 0 || navigation[navigationIndex] != newRoot) {
+            navigation = Array(navigation.prefix(navigationIndex + 1)); navigation.append(newRoot)
+            if navigation.count > 50 { navigation.removeFirst() }
+            navigationIndex = navigation.count - 1
+        }
         root = newRoot; scanID = UUID(); let id = scanID
-        nodes = []; largest = []; selected = nil; scanErrors = []; skipped = 0; scannedFiles = 0; scanBytes = 0
+        nodes = []; largest = []; selected = nil; fileTypes = []; largestFilter = ""; scanErrors = []; skipped = 0; scannedFiles = 0; scanBytes = 0
         storageFilter = ""; isScanning = true; scanComplete = false; start = Date(); elapsed = 0
         guard let handle = ScanHandle() else { isScanning = false; alert = "Could not start the scanner."; return }
         scanHandle = handle
-        let collector = ScanCollector { [weak self] partial, bytes, files, active, skipped in
+        let collector = ScanCollector(rootPath: newRoot) { [weak self] partial, bytes, files, active, skipped in
             let children = partial.filter { $0.parent == newRoot || $0.path == newRoot }
             DispatchQueue.main.async {
                 guard let self, self.scanID == id else { return }
@@ -187,6 +237,7 @@ struct CleanupPolicy {
                 guard let self, self.scanID == id else { return }
                 self.scanHandle = nil; self.isScanning = false
                 self.nodes = collector.nodes; self.largest = Array(collector.largest.sorted { $0.bytes > $1.bytes }.prefix(100))
+                self.fileTypes = collector.fileTypes.values.sorted { $0.bytes > $1.bytes }
                 self.skipped = collector.skipped; self.scanErrors = collector.errors
                 self.elapsed = Date().timeIntervalSince(self.start); self.disk = DiskStatus.read()
                 self.scanComplete = code == 0
@@ -195,6 +246,11 @@ struct CleanupPolicy {
         }
     }
     func stopScan() { scanHandle?.cancel() }
+    func navigate(_ offset: Int) {
+        let next = navigationIndex + offset
+        guard navigation.indices.contains(next) else { return }
+        navigationIndex = next; scan(navigation[next], recordHistory: false)
+    }
     func reveal(_ n: FileNode) { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: n.path)]) }
     func refusal(_ n: FileNode) -> String? { policy.refusal(n.path, runningBundles: runningBundles) }
     func addToQueue(_ n: FileNode) {
@@ -213,13 +269,13 @@ struct CleanupPolicy {
             ["Claude", "Codex", "ChatGPT"].flatMap { a in ["Cache", "Code Cache", "GPUCache"].map { sweepHome + "/Library/Application Support/" + a + "/" + $0 } }
         let handle = ScanHandle(); cleanupHandle = handle
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            var found: [FileNode] = []; var skippedCount = 0
+            var found: [FileNode] = []; var skippedCount = 0; var cancelled = false
             if let handle {
                 for path in roots where FileManager.default.fileExists(atPath: path) {
-                    let collector = ScanCollector { _, _, _, _, _ in }
+                    let collector = ScanCollector(rootPath: path) { _, _, _, _, _ in }
                     let code = ms_scan_run(handle.pointer, path, 1, scanCallback, Unmanaged.passUnretained(collector).toOpaque())
                     skippedCount += collector.skipped
-                    if code == ECANCELED { break }
+                    if code == ECANCELED { cancelled = true; break }
                     let candidates = collector.nodes.filter { n in
                         n.bytes > 1024 * 1024 && ((path == cacheRoot || path == downloads) ? n.parent == path : n.path == path)
                     }.map { n -> FileNode in var item = n; item.category = path == downloads ? "Review download" : "App cache"; return item }
@@ -229,7 +285,7 @@ struct CleanupPolicy {
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }; self.cleanupHandle = nil
                 self.cleanupItems = found.sorted { $0.bytes > $1.bytes }; self.findingCleanup = false
-                self.cleanupNote = "\(found.count) items to review · \(skippedCount) inaccessible locations · Nothing is selected automatically."
+                self.cleanupNote = (cancelled ? "Stopped · partial results. " : "") + "\(found.count) items to review · \(skippedCount) inaccessible locations · Nothing is selected automatically."
             }
         }
     }
@@ -264,7 +320,17 @@ struct CleanupPolicy {
 struct RawProcess {
     let pid: Int32, parent: Int32
     let bytes: UInt64, started: UInt64
+    let resident: UInt64
     let name: String, executable: String, owner: String
+}
+struct ProcessDetail: Identifiable {
+    let pid: Int32
+    let name: String
+    let path: String
+    let bytes: Int64
+    let resident: Int64
+    let started: UInt64
+    var id: Int32 { pid }
 }
 struct MemorySample { let time: Date; let bytes: Int64 }
 struct MemoryRow: Identifiable {
@@ -274,6 +340,10 @@ struct MemoryRow: Identifiable {
     let bytes: Int64
     let processes: [Int32]
     var samples: [MemorySample] = []
+    var details: [ProcessDetail] = []
+    var peak: Int64 { max(bytes, samples.map(\.bytes).max() ?? bytes) }
+    var resident: Int64 { details.reduce(0) { $0 + $1.resident } }
+    var observationSeconds: TimeInterval { max(0, (samples.last?.time ?? Date()).timeIntervalSince(samples.first?.time ?? Date())) }
     var delta: Int64 { bytes - (samples.first?.bytes ?? bytes) }
     var growing: Bool {
         guard samples.count >= 7, let first = samples.first, let last = samples.last,
@@ -316,7 +386,7 @@ struct MemoryRow: Identifiable {
             if let p = pointer {
                 for i in 0..<count {
                     let r = p[i]
-                    raw.append(RawProcess(pid: r.pid, parent: r.parent, bytes: r.footprint, started: r.started, name: cString(r.name), executable: cString(r.executable), owner: cString(r.owner)))
+                    raw.append(RawProcess(pid: r.pid, parent: r.parent, bytes: r.footprint, started: r.started, resident: r.resident, name: cString(r.name), executable: cString(r.executable), owner: cString(r.owner)))
                 }
                 ms_processes_free(p)
             }
@@ -342,10 +412,14 @@ struct MemoryRow: Identifiable {
                 for (key, value) in values {
                     var samples = self.history[key] ?? []
                     // A changed set of helper processes starts a new baseline, avoiding false leak alerts.
-                    if let old = self.rows.first(where: { $0.id == key }), Set(old.processes) != Set(value.3) { samples = [] }
+                    let details = value.3.compactMap { lookup[$0] }.map {
+                        ProcessDetail(pid: $0.pid, name: $0.name, path: $0.executable, bytes: Int64($0.bytes), resident: Int64($0.resident), started: $0.started)
+                    }.sorted { $0.bytes > $1.bytes }
+                    if let old = self.rows.first(where: { $0.id == key }),
+                       Set(old.details.map { "\($0.pid):\($0.started)" }) != Set(details.map { "\($0.pid):\($0.started)" }) { samples = [] }
                     samples.append(MemorySample(time: now, bytes: value.2)); samples = Array(samples.suffix(180))
                     self.history[key] = samples
-                    next.append(MemoryRow(id: key, name: value.0, path: value.1, bytes: value.2, processes: value.3, samples: samples))
+                    next.append(MemoryRow(id: key, name: value.0, path: value.1, bytes: value.2, processes: value.3, samples: samples, details: details))
                 }
                 self.history = self.history.filter { values[$0.key] != nil }; self.rows = next.sorted { $0.bytes > $1.bytes }
                 self.stats = info; self.updated = now; self.sampling = false
